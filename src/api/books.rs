@@ -1005,15 +1005,53 @@ pub async fn list_comments(book_id: String) -> Result<Vec<BookComment>, ServerFn
                 chapter: row.get(5)?,
                 created_at: row.get(6)?,
                 hidden: false,
+                reactions: Vec::new(),
             })
         })
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
+    // Reaction tallies for every comment on this book, in one query.
+    let mut reactions: std::collections::HashMap<String, Vec<crate::models::Reaction>> =
+        std::collections::HashMap::new();
+    {
+        let mut rstmt = conn
+            .prepare(
+                "SELECT cr.comment_id, cr.emoji, COUNT(*),
+                        MAX(CASE WHEN cr.reader = ?2 THEN 1 ELSE 0 END)
+                 FROM comment_reactions cr
+                 JOIN book_comments bc ON bc.id = cr.comment_id
+                 WHERE bc.book_id = ?1
+                 GROUP BY cr.comment_id, cr.emoji",
+            )
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        let rows = rstmt
+            .query_map(rusqlite::params![book_id, me], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    crate::models::Reaction {
+                        emoji: row.get(1)?,
+                        count: row.get(2)?,
+                        mine: row.get::<_, i32>(3)? != 0,
+                    },
+                ))
+            })
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        for r in rows {
+            let (cid, reaction) = r.map_err(|e| ServerFnError::new(e.to_string()))?;
+            reactions.entry(cid).or_default().push(reaction);
+        }
+        // Stable display order: most-reacted first, then emoji.
+        for v in reactions.values_mut() {
+            v.sort_by(|a, b| b.count.cmp(&a.count).then(a.emoji.cmp(&b.emoji)));
+        }
+    }
+
     let gated = comments
         .into_iter()
         .map(|mut c| {
+            c.reactions = reactions.remove(&c.id).unwrap_or_default();
             if c.author != me {
                 let page_spoiler = matches!(c.page, Some(p) if p > my_page.unwrap_or(0));
                 let chap_spoiler =
@@ -1028,6 +1066,58 @@ pub async fn list_comments(book_id: String) -> Result<Vec<BookComment>, ServerFn
         .collect();
 
     Ok(gated)
+}
+
+/// Toggle the calling reader's reaction (one of `REACTION_EMOJIS`) on a
+/// comment: removes it if already set, otherwise adds it.
+#[server(headers: axum::http::HeaderMap)]
+pub async fn react_to_comment(
+    comment_id: String,
+    emoji: String,
+) -> Result<(), ServerFnError> {
+    use crate::server::{auth, db};
+
+    auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
+    let me = auth::display_name_from_headers(&headers);
+
+    if !crate::models::REACTION_EMOJIS.contains(&emoji.as_str()) {
+        return Err(ServerFnError::new("Unsupported reaction"));
+    }
+
+    let conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM book_comments WHERE id = ?1)",
+            rusqlite::params![comment_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if !exists {
+        return Err(ServerFnError::new("Comment not found"));
+    }
+
+    let removed = conn
+        .execute(
+            "DELETE FROM comment_reactions
+             WHERE comment_id = ?1 AND reader = ?2 AND emoji = ?3",
+            rusqlite::params![comment_id, me, emoji],
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    if removed == 0 {
+        let now = chrono::Utc::now().timestamp_millis() as f64;
+        conn.execute(
+            "INSERT INTO comment_reactions (comment_id, reader, emoji, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![comment_id, me, emoji, now],
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    }
+
+    Ok(())
 }
 
 #[server(headers: axum::http::HeaderMap)]

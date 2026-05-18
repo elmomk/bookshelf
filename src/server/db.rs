@@ -95,7 +95,15 @@ pub fn init() {
             login TEXT PRIMARY KEY,
             alias TEXT NOT NULL,
             updated_at REAL NOT NULL
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS comment_reactions (
+            comment_id TEXT NOT NULL REFERENCES book_comments(id) ON DELETE CASCADE,
+            reader TEXT NOT NULL,
+            emoji TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (comment_id, reader, emoji)
+        );
+        CREATE INDEX IF NOT EXISTS idx_reactions_comment ON comment_reactions(comment_id);",
     )
     .expect("Failed to run migrations");
 

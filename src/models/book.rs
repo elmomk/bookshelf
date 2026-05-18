@@ -147,6 +147,21 @@ pub struct BookComment {
     /// When `true`, `body` is blanked.
     #[serde(default)]
     pub hidden: bool,
+    /// Per-emoji reaction tallies for this comment (server-populated).
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
+}
+
+/// The fixed set of allowed comment reactions (kept in sync client/server).
+pub const REACTION_EMOJIS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
+
+/// Aggregated reaction count for one emoji on one comment.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Reaction {
+    pub emoji: String,
+    pub count: i32,
+    /// True if the requesting reader is one of the reactors.
+    pub mine: bool,
 }
 
 /// A Google Books search hit.

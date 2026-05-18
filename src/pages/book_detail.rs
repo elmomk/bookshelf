@@ -5,7 +5,7 @@ use crate::cache::{self, SyncStatus};
 use crate::components::error_banner::ErrorBanner;
 use crate::components::layout::SyncTrigger;
 use crate::components::progress_bar::ProgressBar;
-use crate::models::{Book, BookComment, ReadingProgress, ReadingStatus, TocEntry};
+use crate::models::{Book, BookComment, ReadingProgress, ReadingStatus, TocEntry, REACTION_EMOJIS};
 use crate::route::Route;
 
 /// Multi-select file picker that returns a JSON array of image data URLs via
@@ -974,6 +974,9 @@ fn render_comment(
         };
     }
 
+    // Built before the rsx so the delete button below can still move `reload`.
+    let reactions_el = reaction_bar(&c, reload.clone(), error_msg);
+
     rsx! {
         div { class: "rounded-lg border border-cyber-border bg-cyber-dark/40 px-3 py-2",
             div { class: "flex items-center gap-2",
@@ -1000,6 +1003,58 @@ fn render_comment(
                 }
             }
             p { class: "text-xs text-cyber-text leading-relaxed mt-1 whitespace-pre-wrap", "{c.body}" }
+            {reactions_el}
+        }
+    }
+}
+
+/// A compact, fixed emoji reaction bar under a comment. Tapping toggles the
+/// reader's reaction; counts and a highlight show the current tallies.
+fn reaction_bar(
+    c: &BookComment,
+    reload: impl FnMut() + Clone + 'static,
+    mut error_msg: Signal<Option<String>>,
+) -> Element {
+    let cid = c.id.clone();
+    let find = |e: &str| c.reactions.iter().find(|r| r.emoji == e);
+    rsx! {
+        div { class: "flex flex-wrap items-center gap-1 mt-2",
+            for &emoji in REACTION_EMOJIS.iter() {
+                {
+                    let r = find(emoji);
+                    let count = r.map(|x| x.count).unwrap_or(0);
+                    let mine = r.map(|x| x.mine).unwrap_or(false);
+                    let cls = if mine {
+                        "border-neon-cyan/60 bg-neon-cyan/15 text-neon-cyan"
+                    } else if count > 0 {
+                        "border-cyber-border bg-cyber-dark text-cyber-text"
+                    } else {
+                        "border-transparent text-cyber-dim/40"
+                    };
+                    let cid = cid.clone();
+                    let reload = reload.clone();
+                    rsx! {
+                        button {
+                            r#type: "button",
+                            class: "rounded-full border px-2 py-0.5 text-[11px] leading-none press-scale {cls}",
+                            onclick: move |_| {
+                                let cid = cid.clone();
+                                let emoji = emoji.to_string();
+                                let mut rl = reload.clone();
+                                spawn(async move {
+                                    if let Err(e) =
+                                        crate::api::books::react_to_comment(cid, emoji).await
+                                    {
+                                        error_msg.set(Some(format!("Failed: {e}")));
+                                    }
+                                    rl();
+                                });
+                            },
+                            if count > 0 { "{emoji} {count}" } else { "{emoji}" }
+                        }
+                    }
+                }
+            }
         }
     }
 }
