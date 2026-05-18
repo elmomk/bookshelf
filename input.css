@@ -1,0 +1,277 @@
+@import "tailwindcss";
+
+/* Self-hosted JetBrains Mono for offline PWA */
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/JetBrainsMono-Regular.ttf') format('truetype');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/JetBrainsMono-Medium.ttf') format('truetype');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/JetBrainsMono-Bold.ttf') format('truetype');
+}
+
+@theme {
+  --color-cyber-black: #08080f;
+  --color-cyber-dark: #0d0d1a;
+  --color-cyber-card: #141428;
+  --color-cyber-border: #1e1e3a;
+  --color-neon-cyan: #00f0ff;
+  --color-neon-magenta: #ff2d78;
+  --color-neon-green: #00ff41;
+  --color-neon-orange: #ff8c00;
+  --color-neon-purple: #bf5af2;
+  --color-neon-pink: #ff79c6;
+  --color-neon-yellow: #ffdd00;
+  --color-cyber-text: #e0e0e8;
+  --color-cyber-dim: #5a5a7a;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+}
+
+/* Safelist: dynamic Tailwind classes used via runtime interpolation in Rust/Dioxus.
+   These must appear literally for Tailwind v4's scanner to detect them. */
+.safelist {
+  /* Phase dashboard colors */
+  @apply
+    text-neon-pink text-neon-green text-neon-orange text-neon-purple text-neon-magenta
+    border-neon-pink/30 border-neon-green/30 border-neon-orange/30 border-neon-purple/30 border-neon-magenta/30
+    border-neon-pink/15 border-neon-green/15 border-neon-orange/15 border-neon-purple/15 border-neon-magenta/15
+    border-neon-pink/20 border-neon-green/20 border-neon-orange/20 border-neon-purple/20 border-neon-magenta/20
+    bg-neon-pink/60 bg-neon-green/60 bg-neon-orange/60 bg-neon-purple/60 bg-neon-magenta/60
+    bg-neon-pink/80 bg-neon-green/80 bg-neon-orange/80 bg-neon-purple/80 bg-neon-magenta/80
+    bg-neon-pink/15 bg-neon-green/15 bg-neon-orange/15 bg-neon-purple/15 bg-neon-magenta/15
+    bg-neon-pink/8 bg-neon-green/8 bg-neon-orange/8 bg-neon-purple/8 bg-neon-magenta/8
+    bg-neon-pink/40 bg-neon-green/40 bg-neon-orange/40 bg-neon-purple/40 bg-neon-magenta/40
+    bg-neon-pink/10 bg-neon-green/10 bg-neon-orange/10 bg-neon-purple/10 bg-neon-magenta/10;
+}
+
+/* Scanline overlay effect */
+.scanlines::after {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.03) 2px,
+    rgba(0, 0, 0, 0.03) 4px
+  );
+}
+
+/* Neon glow utilities */
+.glow-cyan {
+  box-shadow: 0 0 8px rgba(0, 240, 255, 0.3), inset 0 0 8px rgba(0, 240, 255, 0.05);
+}
+
+.glow-magenta {
+  box-shadow: 0 0 8px rgba(255, 45, 120, 0.3), inset 0 0 8px rgba(255, 45, 120, 0.05);
+}
+
+.glow-green {
+  box-shadow: 0 0 8px rgba(0, 255, 65, 0.3), inset 0 0 8px rgba(0, 255, 65, 0.05);
+}
+
+.glow-orange {
+  box-shadow: 0 0 8px rgba(255, 140, 0, 0.3), inset 0 0 8px rgba(255, 140, 0, 0.05);
+}
+
+.glow-purple {
+  box-shadow: 0 0 8px rgba(191, 90, 242, 0.3), inset 0 0 8px rgba(191, 90, 242, 0.05);
+}
+
+.glow-pink {
+  box-shadow: 0 0 8px rgba(255, 121, 198, 0.3), inset 0 0 8px rgba(255, 121, 198, 0.05);
+}
+
+.text-glow-cyan {
+  text-shadow: 0 0 8px rgba(0, 240, 255, 0.5);
+}
+
+.text-glow-magenta {
+  text-shadow: 0 0 8px rgba(255, 45, 120, 0.5);
+}
+
+.text-glow-green {
+  text-shadow: 0 0 8px rgba(0, 255, 65, 0.5);
+}
+
+.text-glow-pink {
+  text-shadow: 0 0 8px rgba(255, 121, 198, 0.5);
+}
+
+/* Cyberpunk scrollbar */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: #08080f;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e1e3a;
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #00f0ff;
+}
+
+/* Hide scrollbar for chips */
+.scrollbar-hide::-webkit-scrollbar { display: none; }
+.scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* Safe area for bottom nav */
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Active press feedback — applied to all interactive elements */
+.press-scale {
+  transition: transform 160ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+.press-scale:active {
+  transform: scale(0.97);
+}
+
+/* Gate hover effects behind pointer device media query */
+@media (hover: hover) and (pointer: fine) {
+  .hover-glow-cyan:hover { box-shadow: 0 0 8px rgba(0, 240, 255, 0.3), inset 0 0 8px rgba(0, 240, 255, 0.05); }
+  .hover-glow-green:hover { box-shadow: 0 0 8px rgba(0, 255, 65, 0.3), inset 0 0 8px rgba(0, 255, 65, 0.05); }
+}
+
+/* List item entry animation with stagger */
+@keyframes item-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.item-enter {
+  animation: item-enter 250ms cubic-bezier(0.23, 1, 0.32, 1) both;
+}
+.item-enter:nth-child(1) { animation-delay: 0ms; }
+.item-enter:nth-child(2) { animation-delay: 40ms; }
+.item-enter:nth-child(3) { animation-delay: 80ms; }
+.item-enter:nth-child(4) { animation-delay: 120ms; }
+.item-enter:nth-child(5) { animation-delay: 160ms; }
+.item-enter:nth-child(6) { animation-delay: 200ms; }
+.item-enter:nth-child(7) { animation-delay: 240ms; }
+.item-enter:nth-child(8) { animation-delay: 280ms; }
+
+/* List item exit animation */
+@keyframes item-exit {
+  to {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+}
+
+/* Notification dropdown animation */
+.dropdown-enter {
+  animation: dropdown-enter 150ms cubic-bezier(0.23, 1, 0.32, 1) both;
+  transform-origin: top right;
+}
+@keyframes dropdown-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Error banner animation */
+.banner-enter {
+  animation: banner-enter 200ms cubic-bezier(0.23, 1, 0.32, 1) both;
+}
+@keyframes banner-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Page content crossfade */
+.page-enter {
+  animation: page-fade 150ms ease-out both;
+}
+@keyframes page-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Quick-add chips fade mask */
+.chips-fade-mask {
+  mask-image: linear-gradient(to right, black 85%, transparent);
+  -webkit-mask-image: linear-gradient(to right, black 85%, transparent);
+}
+
+/* Dark-themed date picker */
+input[type="date"] {
+  color-scheme: dark;
+}
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.7) sepia(1) saturate(5) hue-rotate(150deg);
+  cursor: pointer;
+}
+
+/* Swipe hint animation */
+@keyframes hint-swipe {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(12px); }
+  50% { transform: translateX(-12px); }
+  75% { transform: translateX(0); }
+}
+.swipe-hint {
+  animation: hint-swipe 800ms cubic-bezier(0.23, 1, 0.32, 1) 1s 1;
+}
+
+/* Card flip for explore */
+.flip-card {
+  perspective: 800px;
+}
+.flip-card-inner {
+  position: relative;
+  transition: transform 400ms cubic-bezier(0.23, 1, 0.32, 1);
+  transform-style: preserve-3d;
+}
+.flip-card-inner.flipped {
+  transform: rotateY(180deg);
+}
+.flip-card-front,
+.flip-card-back {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+.flip-card-back {
+  position: absolute;
+  inset: 0;
+  transform: rotateY(180deg);
+}

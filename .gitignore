@@ -1,0 +1,16 @@
+target/
+node_modules/
+life_manager.db
+life_manager.db-shm
+life_manager.db-wal
+bookclub.db
+bookclub.db-shm
+bookclub.db-wal
+dist/
+.buildtmp/
+.env
+.claude/settings.local.json
+assets/main.css
+gorilla-coach-sheets-key.json
+venv/
+todo/

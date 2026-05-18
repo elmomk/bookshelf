@@ -1,0 +1,11 @@
+target/
+!target/dx/bookclub/release/web/
+node_modules/
+bookclub.db
+dist/
+.git/
+.env
+.claude/
+docs/
+scripts/
+spec.md

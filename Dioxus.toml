@@ -1,0 +1,21 @@
+[application]
+name = "bookclub"
+default_platform = "fullstack"
+out_dir = "dist"
+asset_dir = "assets"
+
+[web.app]
+title = "BookClub"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "assets"]
+index_on_404 = true
+
+[web.resource]
+style = []
+script = ["/sw-register.js"]
+
+[web.resource.dev]
+style = []
+script = []

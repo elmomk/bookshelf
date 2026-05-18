@@ -1,0 +1,13 @@
+{
+  "name": "bookclub",
+  "scripts": {
+    "tailwind": "npx @tailwindcss/cli -i ./input.css -o ./assets/main.css --watch"
+  },
+  "dependencies": {
+    "@tailwindcss/cli": "^4.2.2",
+    "tailwindcss": "^4.2.2"
+  },
+  "devDependencies": {
+    "playwright": "^1.58.2"
+  }
+}

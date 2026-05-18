@@ -1,0 +1,40 @@
+[package]
+name = "bookclub"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dioxus = { version = "=0.7.3", features = ["router", "fullstack"] }
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
+
+[features]
+default = ["web", "server"]
+web = ["dioxus/web"]
+server = ["dioxus/server"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window", "Storage", "Navigator"] }
+js-sys = "0.3"
+
+[profile.release]
+strip = "debuginfo"
+lto = true
+codegen-units = 1
+opt-level = "s"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+axum = "0.8"
+base64 = "0.22"
+tempfile = "3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff"] }
+reqwest = { version = "0.12", features = ["json"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "compression-br"] }
+web-push = "0.11.0"
