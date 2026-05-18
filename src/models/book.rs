@@ -152,7 +152,8 @@ pub struct BookComment {
     pub reactions: Vec<Reaction>,
 }
 
-/// The fixed set of allowed comment reactions (kept in sync client/server).
+/// Quick-pick reactions shown in the picker. Any emoji from the keyboard is
+/// allowed; these are just convenient shortcuts.
 pub const REACTION_EMOJIS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
 
 /// Aggregated reaction count for one emoji on one comment.

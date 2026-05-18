@@ -1080,8 +1080,18 @@ pub async fn react_to_comment(
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
     let me = auth::display_name_from_headers(&headers);
 
-    if !crate::models::REACTION_EMOJIS.contains(&emoji.as_str()) {
-        return Err(ServerFnError::new("Unsupported reaction"));
+    // Accept any emoji from the user's keyboard, but guard against abuse:
+    // non-empty, short, no ASCII letters / whitespace / control, and at
+    // least one non-ASCII char (so it can't be used as a free-text tag).
+    let emoji = emoji.trim().to_string();
+    let invalid = emoji.is_empty()
+        || emoji.len() > 32
+        || emoji
+            .chars()
+            .any(|ch| ch.is_ascii_alphabetic() || ch.is_whitespace() || ch.is_control())
+        || !emoji.chars().any(|ch| !ch.is_ascii());
+    if invalid {
+        return Err(ServerFnError::new("Invalid reaction"));
     }
 
     let conn = db::pool()

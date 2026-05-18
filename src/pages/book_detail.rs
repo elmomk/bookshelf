@@ -108,6 +108,9 @@ pub fn BookDetail(id: String) -> Element {
     let mut anchor_page = use_signal(String::new);
     let mut anchor_chapter = use_signal(String::new);
     let mut comment_filter = use_signal(String::new);
+    // Which comment's emoji picker is open, and its input buffer.
+    let react_open = use_signal(|| None::<String>);
+    let react_buf = use_signal(String::new);
 
     let reload = {
         let book_id = book_id.clone();
@@ -696,7 +699,7 @@ pub fn BookDetail(id: String) -> Element {
                                     }
                                 }
                                 for c in visible.iter() {
-                                    {render_comment(c.clone(), me_now.clone(), reload.clone(), error_msg)}
+                                    {render_comment(c.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf)}
                                 }
                             }
                         }
@@ -948,6 +951,8 @@ fn render_comment(
     me: String,
     reload: impl FnMut() + Clone + 'static,
     mut error_msg: Signal<Option<String>>,
+    react_open: Signal<Option<String>>,
+    react_buf: Signal<String>,
 ) -> Element {
     let anchor = match (c.page, c.chapter) {
         (Some(p), Some(ch)) => Some(format!("p.{p} · ch.{ch}")),
@@ -975,7 +980,7 @@ fn render_comment(
     }
 
     // Built before the rsx so the delete button below can still move `reload`.
-    let reactions_el = reaction_bar(&c, reload.clone(), error_msg);
+    let reactions_el = reaction_bar(&c, reload.clone(), error_msg, react_open, react_buf);
 
     rsx! {
         div { class: "rounded-lg border border-cyber-border bg-cyber-dark/40 px-3 py-2",
@@ -1008,29 +1013,29 @@ fn render_comment(
     }
 }
 
-/// A compact, fixed emoji reaction bar under a comment. Tapping toggles the
-/// reader's reaction; counts and a highlight show the current tallies.
+/// Reaction bar under a comment: existing reactions as toggle chips, plus a
+/// `＋` that opens a native text input so any emoji from the phone keyboard
+/// can be used (with a few quick picks for convenience).
 fn reaction_bar(
     c: &BookComment,
     reload: impl FnMut() + Clone + 'static,
     mut error_msg: Signal<Option<String>>,
+    mut react_open: Signal<Option<String>>,
+    mut react_buf: Signal<String>,
 ) -> Element {
     let cid = c.id.clone();
-    let find = |e: &str| c.reactions.iter().find(|r| r.emoji == e);
+    let reactions = c.reactions.clone();
+    let open = react_open.read().as_ref() == Some(&cid);
     rsx! {
         div { class: "flex flex-wrap items-center gap-1 mt-2",
-            for &emoji in REACTION_EMOJIS.iter() {
+            for r in reactions.iter() {
                 {
-                    let r = find(emoji);
-                    let count = r.map(|x| x.count).unwrap_or(0);
-                    let mine = r.map(|x| x.mine).unwrap_or(false);
-                    let cls = if mine {
+                    let cls = if r.mine {
                         "border-neon-cyan/60 bg-neon-cyan/15 text-neon-cyan"
-                    } else if count > 0 {
-                        "border-cyber-border bg-cyber-dark text-cyber-text"
                     } else {
-                        "border-transparent text-cyber-dim/40"
+                        "border-cyber-border bg-cyber-dark text-cyber-text"
                     };
+                    let emoji = r.emoji.clone();
                     let cid = cid.clone();
                     let reload = reload.clone();
                     rsx! {
@@ -1039,7 +1044,7 @@ fn reaction_bar(
                             class: "rounded-full border px-2 py-0.5 text-[11px] leading-none press-scale {cls}",
                             onclick: move |_| {
                                 let cid = cid.clone();
-                                let emoji = emoji.to_string();
+                                let emoji = emoji.clone();
                                 let mut rl = reload.clone();
                                 spawn(async move {
                                     if let Err(e) =
@@ -1050,7 +1055,88 @@ fn reaction_bar(
                                     rl();
                                 });
                             },
-                            if count > 0 { "{emoji} {count}" } else { "{emoji}" }
+                            "{r.emoji} {r.count}"
+                        }
+                    }
+                }
+            }
+            button {
+                r#type: "button",
+                class: "rounded-full border border-cyber-border text-cyber-dim px-2 py-0.5 text-[11px] leading-none press-scale",
+                onclick: {
+                    let cid = cid.clone();
+                    move |_| {
+                        if react_open.read().as_ref() == Some(&cid) {
+                            react_open.set(None);
+                        } else {
+                            react_buf.set(String::new());
+                            react_open.set(Some(cid.clone()));
+                        }
+                    }
+                },
+                "＋"
+            }
+            if open {
+                input {
+                    class: "w-14 bg-cyber-dark border border-neon-cyan/40 rounded-full px-2 py-0.5 text-[13px] text-cyber-text outline-none text-center",
+                    r#type: "text",
+                    autofocus: true,
+                    autocomplete: "off",
+                    value: "{react_buf}",
+                    placeholder: "🙂",
+                    oninput: {
+                        let cid = cid.clone();
+                        let reload = reload.clone();
+                        move |e| {
+                            let v = e.value();
+                            // Submit on the first emoji; ignore plain typing.
+                            let picked: String =
+                                v.chars().filter(|ch| !ch.is_ascii()).collect();
+                            if picked.is_empty() {
+                                react_buf.set(v);
+                                return;
+                            }
+                            react_open.set(None);
+                            react_buf.set(String::new());
+                            let cid = cid.clone();
+                            let mut rl = reload.clone();
+                            spawn(async move {
+                                if let Err(e) =
+                                    crate::api::books::react_to_comment(cid, picked).await
+                                {
+                                    error_msg.set(Some(format!("Failed: {e}")));
+                                }
+                                rl();
+                            });
+                        }
+                    },
+                }
+                for &q in REACTION_EMOJIS.iter() {
+                    {
+                        let cid = cid.clone();
+                        let reload = reload.clone();
+                        rsx! {
+                            button {
+                                r#type: "button",
+                                class: "rounded-full border border-cyber-border px-2 py-0.5 text-[13px] leading-none press-scale",
+                                onclick: move |_| {
+                                    react_open.set(None);
+                                    let cid = cid.clone();
+                                    let mut rl = reload.clone();
+                                    spawn(async move {
+                                        if let Err(e) = crate::api::books::react_to_comment(
+                                            cid,
+                                            q.to_string(),
+                                        )
+                                        .await
+                                        {
+                                            error_msg.set(Some(format!("Failed: {e}")));
+                                        }
+                                        rl();
+                                    });
+                                },
+                                "{q}"
+                            }
                         }
                     }
                 }
