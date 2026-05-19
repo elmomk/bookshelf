@@ -113,6 +113,8 @@ pub fn BookDetail(id: String) -> Element {
     // Which comment's emoji picker is open, and its input buffer.
     let react_open = use_signal(|| None::<String>);
     let react_buf = use_signal(String::new);
+    // Picker mid-exit (kept rendered briefly so its close can animate).
+    let react_closing = use_signal(|| None::<String>);
     // Which top-level comment a reply is being composed for, and its buffer.
     let reply_to = use_signal(|| None::<String>);
     let reply_body = use_signal(String::new);
@@ -727,11 +729,11 @@ pub fn BookDetail(id: String) -> Element {
                                 }
                                 if threaded {
                                     for (root, kids) in threads.iter() {
-                                        {render_comment(root.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, bid.clone(), reply_to, reply_body, expanded, revealed, kids.clone(), true)}
+                                        {render_comment(root.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, react_closing, bid.clone(), reply_to, reply_body, expanded, revealed, kids.clone(), true)}
                                     }
                                 } else {
                                     for c in visible.iter() {
-                                        {render_comment(c.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, bid.clone(), reply_to, reply_body, expanded, revealed, Vec::new(), false)}
+                                        {render_comment(c.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, react_closing, bid.clone(), reply_to, reply_body, expanded, revealed, Vec::new(), false)}
                                     }
                                 }
                             }
@@ -987,6 +989,7 @@ fn render_comment(
     mut error_msg: Signal<Option<String>>,
     react_open: Signal<Option<String>>,
     react_buf: Signal<String>,
+    react_closing: Signal<Option<String>>,
     book_id: String,
     mut reply_to: Signal<Option<String>>,
     mut reply_body: Signal<String>,
@@ -1055,7 +1058,7 @@ fn render_comment(
             }
         }
     } else {
-        let reactions_el = reaction_bar(&c, reload.clone(), error_msg, react_open, react_buf);
+        let reactions_el = reaction_bar(&c, reload.clone(), error_msg, react_open, react_buf, react_closing);
         let del_reload = reload.clone();
         rsx! {
             div { class: "rounded-lg border border-cyber-border bg-cyber-dark/40 px-3 py-2",
@@ -1225,7 +1228,7 @@ fn render_comment(
                 for r in replies.iter() {
                     {render_comment(
                         r.clone(), me.clone(), reload.clone(), error_msg,
-                        react_open, react_buf, book_id.clone(),
+                        react_open, react_buf, react_closing, book_id.clone(),
                         reply_to, reply_body, expanded, revealed, Vec::new(), false,
                     )}
                 }
@@ -1243,10 +1246,26 @@ fn reaction_bar(
     mut error_msg: Signal<Option<String>>,
     mut react_open: Signal<Option<String>>,
     mut react_buf: Signal<String>,
+    mut react_closing: Signal<Option<String>>,
 ) -> Element {
     let cid = c.id.clone();
     let reactions = c.reactions.clone();
     let open = react_open.read().as_ref() == Some(&cid);
+    let closing = react_closing.read().as_ref() == Some(&cid);
+
+    // Close with an exit animation: hide it, keep it briefly mounted so the
+    // `.pop-out` plays, then truly unmount.
+    let close_picker = move |id: String| {
+        react_open.set(None);
+        react_closing.set(Some(id.clone()));
+        spawn(async move {
+            anim_sleep(140).await;
+            if react_closing.read().as_ref() == Some(&id) {
+                react_closing.set(None);
+            }
+        });
+    };
+
     rsx! {
         div { class: "flex flex-wrap items-center gap-1 mt-2",
             for r in reactions.iter() {
@@ -1286,10 +1305,12 @@ fn reaction_bar(
                 class: "rounded-full border border-cyber-border text-cyber-dim px-2 py-0.5 text-[11px] leading-none press-scale",
                 onclick: {
                     let cid = cid.clone();
+                    let mut close_picker = close_picker;
                     move |_| {
                         if react_open.read().as_ref() == Some(&cid) {
-                            react_open.set(None);
+                            close_picker(cid.clone());
                         } else {
+                            react_closing.set(None);
                             react_buf.set(String::new());
                             react_open.set(Some(cid.clone()));
                         }
@@ -1297,74 +1318,79 @@ fn reaction_bar(
                 },
                 "＋"
             }
-            if open {
-                input {
-                    class: "w-14 bg-cyber-dark border border-neon-cyan/40 rounded-full px-2 py-0.5 text-[13px] text-cyber-text outline-none text-center pop-in",
-                    r#type: "text",
-                    inputmode: "text",
-                    autocomplete: "off",
-                    // `autofocus` only fires on initial page load, not for a
-                    // dynamically-inserted input, so the soft keyboard never
-                    // opened. Focus it explicitly the moment it mounts.
-                    onmounted: move |e| {
-                        spawn(async move {
-                            let _ = e.set_focus(true).await;
-                        });
-                    },
-                    value: "{react_buf}",
-                    placeholder: "🙂",
-                    oninput: {
-                        let cid = cid.clone();
-                        let reload = reload.clone();
-                        move |e| {
-                            let v = e.value();
-                            // Submit on the first emoji; ignore plain typing.
-                            let picked: String =
-                                v.chars().filter(|ch| !ch.is_ascii()).collect();
-                            if picked.is_empty() {
-                                react_buf.set(v);
-                                return;
-                            }
-                            react_open.set(None);
-                            react_buf.set(String::new());
-                            let cid = cid.clone();
-                            let mut rl = reload.clone();
+            if open || closing {
+                div {
+                    class: if closing { "flex items-center gap-1 pop-out" } else { "flex items-center gap-1 pop-in" },
+                    input {
+                        class: "w-14 bg-cyber-dark border border-neon-cyan/40 rounded-full px-2 py-0.5 text-[13px] text-cyber-text outline-none text-center",
+                        r#type: "text",
+                        inputmode: "text",
+                        autocomplete: "off",
+                        // `autofocus` only fires on initial page load, not for a
+                        // dynamically-inserted input, so the soft keyboard never
+                        // opened. Focus it explicitly the moment it mounts.
+                        onmounted: move |e| {
                             spawn(async move {
-                                if let Err(e) =
-                                    crate::api::books::react_to_comment(cid, picked).await
-                                {
-                                    error_msg.set(Some(format!("Failed: {e}")));
-                                }
-                                rl();
+                                let _ = e.set_focus(true).await;
                             });
-                        }
-                    },
-                }
-                for &q in REACTION_EMOJIS.iter() {
-                    {
-                        let cid = cid.clone();
-                        let reload = reload.clone();
-                        rsx! {
-                            button {
-                                r#type: "button",
-                                class: "rounded-full border border-cyber-border px-2 py-0.5 text-[13px] leading-none press-scale",
-                                onclick: move |_| {
-                                    react_open.set(None);
-                                    let cid = cid.clone();
-                                    let mut rl = reload.clone();
-                                    spawn(async move {
-                                        if let Err(e) = crate::api::books::react_to_comment(
-                                            cid,
-                                            q.to_string(),
-                                        )
-                                        .await
-                                        {
-                                            error_msg.set(Some(format!("Failed: {e}")));
-                                        }
-                                        rl();
-                                    });
-                                },
-                                "{q}"
+                        },
+                        value: "{react_buf}",
+                        placeholder: "🙂",
+                        oninput: {
+                            let cid = cid.clone();
+                            let reload = reload.clone();
+                            let mut close_picker = close_picker;
+                            move |e| {
+                                let v = e.value();
+                                // Submit on the first emoji; ignore plain typing.
+                                let picked: String =
+                                    v.chars().filter(|ch| !ch.is_ascii()).collect();
+                                if picked.is_empty() {
+                                    react_buf.set(v);
+                                    return;
+                                }
+                                close_picker(cid.clone());
+                                react_buf.set(String::new());
+                                let cid = cid.clone();
+                                let mut rl = reload.clone();
+                                spawn(async move {
+                                    if let Err(e) =
+                                        crate::api::books::react_to_comment(cid, picked).await
+                                    {
+                                        error_msg.set(Some(format!("Failed: {e}")));
+                                    }
+                                    rl();
+                                });
+                            }
+                        },
+                    }
+                    for &q in REACTION_EMOJIS.iter() {
+                        {
+                            let cid = cid.clone();
+                            let reload = reload.clone();
+                            let mut close_picker = close_picker;
+                            rsx! {
+                                button {
+                                    r#type: "button",
+                                    class: "rounded-full border border-cyber-border px-2 py-0.5 text-[13px] leading-none press-scale",
+                                    onclick: move |_| {
+                                        close_picker(cid.clone());
+                                        let cid = cid.clone();
+                                        let mut rl = reload.clone();
+                                        spawn(async move {
+                                            if let Err(e) = crate::api::books::react_to_comment(
+                                                cid,
+                                                q.to_string(),
+                                            )
+                                            .await
+                                            {
+                                                error_msg.set(Some(format!("Failed: {e}")));
+                                            }
+                                            rl();
+                                        });
+                                    },
+                                    "{q}"
+                                }
                             }
                         }
                     }
@@ -1373,6 +1399,18 @@ fn reaction_bar(
         }
     }
 }
+
+/// Await `ms` milliseconds (used to keep an exiting element mounted just long
+/// enough for its CSS exit animation). Uses the existing eval bridge so no
+/// timer crate is needed; a no-op on the server.
+#[cfg(target_arch = "wasm32")]
+async fn anim_sleep(ms: u32) {
+    let mut e = document::eval(&format!("setTimeout(() => dioxus.send(0), {ms})"));
+    let _ = e.recv::<i32>().await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn anim_sleep(_ms: u32) {}
 
 fn format_ago(created_at: f64) -> String {
     #[cfg(target_arch = "wasm32")]

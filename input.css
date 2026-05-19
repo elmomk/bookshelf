@@ -195,20 +195,43 @@
   }
 }
 
-/* Notification dropdown animation */
-.dropdown-enter {
-  animation: dropdown-enter 150ms cubic-bezier(0.23, 1, 0.32, 1) both;
+/* Notification dropdown — origin-aware enter AND exit, no JS timers.
+   The element stays mounted; `.is-closed` toggles it. `allow-discrete`
+   defers `display:none` until the opacity/transform exit finishes. Exit
+   (120ms) is snappier than enter (150ms). */
+.menu-pop {
+  opacity: 1;
+  transform: scale(1);
   transform-origin: top right;
+  transition: opacity 150ms cubic-bezier(0.23, 1, 0.32, 1),
+    transform 150ms cubic-bezier(0.23, 1, 0.32, 1),
+    display 150ms allow-discrete;
 }
-@keyframes dropdown-enter {
-  from {
+@starting-style {
+  .menu-pop {
     opacity: 0;
     transform: scale(0.95);
   }
+}
+.menu-pop.is-closed {
+  opacity: 0;
+  transform: scale(0.96);
+  display: none;
+  pointer-events: none;
+  transition: opacity 120ms ease-out, transform 120ms ease-out,
+    display 120ms allow-discrete;
+}
+
+/* Reaction picker exit (it must stay conditionally-rendered for the
+   focus-on-open keyboard fix, so this plays during a brief delayed unmount). */
+@keyframes pop-out {
   to {
-    opacity: 1;
-    transform: scale(1);
+    opacity: 0;
+    transform: scale(0.97);
   }
+}
+.pop-out {
+  animation: pop-out 120ms ease-out both;
 }
 
 /* Error banner animation */
@@ -293,9 +316,24 @@ input[type="date"]::-webkit-calendar-picker-indicator {
   .item-enter:nth-child(n) {
     animation-delay: 0ms;
   }
-  .dropdown-enter,
   .banner-enter {
     animation: page-fade 150ms ease-out both;
+  }
+  .menu-pop {
+    transition: opacity 130ms ease-out, display 130ms allow-discrete;
+    transform: none;
+  }
+  @starting-style {
+    .menu-pop {
+      transform: none;
+    }
+  }
+  .menu-pop.is-closed {
+    transform: none;
+    transition: opacity 110ms ease-out, display 110ms allow-discrete;
+  }
+  .pop-out {
+    animation: page-fade 110ms ease-out reverse both;
   }
   .swipe-hint {
     animation: none;

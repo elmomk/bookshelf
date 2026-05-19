@@ -61,10 +61,12 @@ pub fn NotificationBell() -> Element {
                     class: "fixed inset-0 z-40",
                     onclick: move |_| dropdown_open.set(false),
                 }
-                NotificationDropdown {
-                    status: status,
-                    on_close: move |_| dropdown_open.set(false),
-                }
+            }
+            // Always mounted so CSS can animate the exit; `.is-closed` hides it.
+            NotificationDropdown {
+                status,
+                closed: !*dropdown_open.read(),
+                on_close: move |_| dropdown_open.set(false),
             }
         }
     }
@@ -73,6 +75,7 @@ pub fn NotificationBell() -> Element {
 #[component]
 fn NotificationDropdown(
     mut status: Signal<NotificationStatus>,
+    closed: bool,
     on_close: EventHandler<()>,
 ) -> Element {
     let mut enabled = use_signal(|| false);
@@ -89,7 +92,12 @@ fn NotificationDropdown(
 
     rsx! {
         div {
-            class: "absolute right-0 top-10 z-50 w-72 max-h-80 overflow-y-auto rounded-lg bg-cyber-dark border border-cyber-border shadow-lg shadow-black/50 dropdown-enter",
+            class: if closed {
+                "absolute right-0 top-10 z-50 w-72 max-h-80 overflow-y-auto rounded-lg bg-cyber-dark border border-cyber-border shadow-lg shadow-black/50 menu-pop is-closed"
+            } else {
+                "absolute right-0 top-10 z-50 w-72 max-h-80 overflow-y-auto rounded-lg bg-cyber-dark border border-cyber-border shadow-lg shadow-black/50 menu-pop"
+            },
+            "aria-hidden": "{closed}",
 
             // Header
             div { class: "sticky top-0 bg-cyber-dark border-b border-cyber-border px-3 py-2 flex items-center justify-between",
