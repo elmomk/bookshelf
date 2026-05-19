@@ -1131,12 +1131,7 @@ pub async fn react_to_comment(
 }
 
 #[server(headers: axum::http::HeaderMap)]
-pub async fn add_comment(
-    book_id: String,
-    body: String,
-    page: Option<i32>,
-    chapter: Option<i32>,
-) -> Result<(), ServerFnError> {
+pub async fn add_comment(book_id: String, body: String) -> Result<(), ServerFnError> {
     use crate::server::{auth, db, validate};
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
@@ -1146,6 +1141,18 @@ pub async fn add_comment(
     }
     validate::text(&body, "comment")?;
     let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    // Every comment is anchored to the commenter's current reading position
+    // so spoiler-gating always applies (no opt-in). If they have no progress
+    // yet, it stays unanchored (visible to all).
+    let (page, chapter): (Option<i32>, Option<i32>) = conn
+        .query_row(
+            "SELECT current_page, current_chapter FROM reading_progress
+             WHERE book_id = ?1 AND reader = ?2",
+            rusqlite::params![book_id, me],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((None, None));
 
     let title: Option<String> = conn
         .query_row(

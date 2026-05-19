@@ -104,9 +104,6 @@ pub fn BookDetail(id: String) -> Element {
     let mut ocr_status = use_signal(String::new);
 
     let mut comment_body = use_signal(String::new);
-    let mut anchor_on = use_signal(|| false);
-    let mut anchor_page = use_signal(String::new);
-    let mut anchor_chapter = use_signal(String::new);
     let mut comment_filter = use_signal(String::new);
     // Which comment's emoji picker is open, and its input buffer.
     let react_open = use_signal(|| None::<String>);
@@ -269,22 +266,11 @@ pub fn BookDetail(id: String) -> Element {
             if body.is_empty() {
                 return;
             }
-            let (page, chapter) = if *anchor_on.read() {
-                (
-                    anchor_page.read().trim().parse::<i32>().ok(),
-                    anchor_chapter.read().trim().parse::<i32>().ok(),
-                )
-            } else {
-                (None, None)
-            };
             let book_id = book_id.clone();
             let reload = reload.clone();
             comment_body.set(String::new());
-            anchor_on.set(false);
-            anchor_page.set(String::new());
-            anchor_chapter.set(String::new());
             spawn(async move {
-                if let Err(e) = api::add_comment(book_id, body, page, chapter).await {
+                if let Err(e) = api::add_comment(book_id, body).await {
                     error_msg.set(Some(format!("Failed to post: {e}")));
                 }
                 reload();
@@ -607,36 +593,8 @@ pub fn BookDetail(id: String) -> Element {
                             oninput: move |e| comment_body.set(e.value()),
                         }
                         div { class: "flex items-center gap-2 flex-wrap",
-                            button {
-                                r#type: "button",
-                                class: if *anchor_on.read() {
-                                    "px-2.5 py-1 rounded-md bg-neon-orange/15 border border-neon-orange/40 text-neon-orange text-[10px] font-bold tracking-wider press-scale"
-                                } else {
-                                    "px-2.5 py-1 rounded-md bg-cyber-dark border border-cyber-border text-cyber-dim text-[10px] font-bold tracking-wider press-scale"
-                                },
-                                onclick: move |_| {
-                                    let v = !*anchor_on.read();
-                                    anchor_on.set(v);
-                                },
-                                "🔖 ANCHOR (SPOILER-SAFE)"
-                            }
-                            if *anchor_on.read() {
-                                input {
-                                    class: "w-20 bg-cyber-dark border border-cyber-border rounded px-2 py-1 text-xs text-cyber-text outline-none font-mono",
-                                    r#type: "number",
-                                    inputmode: "numeric",
-                                    placeholder: "page",
-                                    value: "{anchor_page}",
-                                    oninput: move |e| anchor_page.set(e.value()),
-                                }
-                                input {
-                                    class: "w-20 bg-cyber-dark border border-cyber-border rounded px-2 py-1 text-xs text-cyber-text outline-none font-mono",
-                                    r#type: "number",
-                                    inputmode: "numeric",
-                                    placeholder: "ch.",
-                                    value: "{anchor_chapter}",
-                                    oninput: move |e| anchor_chapter.set(e.value()),
-                                }
+                            span { class: "text-[9px] text-cyber-dim",
+                                "🔖 Auto-anchored to your current section — hidden from readers behind you."
                             }
                             button {
                                 r#type: "button",
