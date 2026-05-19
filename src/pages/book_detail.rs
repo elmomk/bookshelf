@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use dioxus::prelude::*;
 
 use crate::api::books as api;
@@ -111,6 +113,8 @@ pub fn BookDetail(id: String) -> Element {
     // Which top-level comment a reply is being composed for, and its buffer.
     let reply_to = use_signal(|| None::<String>);
     let reply_body = use_signal(String::new);
+    // Roots whose replies are folded away.
+    let folded = use_signal(HashSet::<String>::new);
 
     let reload = {
         let book_id = book_id.clone();
@@ -686,11 +690,11 @@ pub fn BookDetail(id: String) -> Element {
                                 }
                                 if threaded {
                                     for (root, kids) in threads.iter() {
-                                        {render_comment(root.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, bid.clone(), reply_to, reply_body, kids.clone(), true)}
+                                        {render_comment(root.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, bid.clone(), reply_to, reply_body, folded, kids.clone(), true)}
                                     }
                                 } else {
                                     for c in visible.iter() {
-                                        {render_comment(c.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, bid.clone(), reply_to, reply_body, Vec::new(), false)}
+                                        {render_comment(c.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, bid.clone(), reply_to, reply_body, folded, Vec::new(), false)}
                                     }
                                 }
                             }
@@ -949,6 +953,7 @@ fn render_comment(
     book_id: String,
     mut reply_to: Signal<Option<String>>,
     mut reply_body: Signal<String>,
+    mut folded: Signal<HashSet<String>>,
     replies: Vec<BookComment>,
     allow_reply: bool,
 ) -> Element {
@@ -962,6 +967,9 @@ fn render_comment(
     let del_id = c.id.clone();
     let cid = c.id.clone();
     let replying = reply_to.read().as_ref() == Some(&cid);
+    let reply_count = replies.len();
+    let foldable = allow_reply && reply_count > 0;
+    let is_folded = foldable && folded.read().contains(&cid);
 
     let self_box = if c.hidden {
         rsx! {
@@ -1069,19 +1077,36 @@ fn render_comment(
                         }
                     }
                 }
+                if foldable {
+                    button {
+                        r#type: "button",
+                        class: "mt-2 ml-3 text-[10px] font-bold tracking-wider uppercase text-neon-cyan/70 press-scale",
+                        onclick: {
+                            let cid = cid.clone();
+                            move |_| {
+                                folded.with_mut(|s| {
+                                    if !s.remove(&cid) {
+                                        s.insert(cid.clone());
+                                    }
+                                });
+                            }
+                        },
+                        if is_folded { "▸ Show {reply_count} replies" } else { "▾ Hide replies" }
+                    }
+                }
             }
         }
     };
 
     rsx! {
         {self_box}
-        if !replies.is_empty() {
+        if !replies.is_empty() && !is_folded {
             div { class: "ml-4 pl-3 border-l border-cyber-border/60 space-y-2 mt-2",
                 for r in replies.iter() {
                     {render_comment(
                         r.clone(), me.clone(), reload.clone(), error_msg,
                         react_open, react_buf, book_id.clone(),
-                        reply_to, reply_body, Vec::new(), false,
+                        reply_to, reply_body, folded, Vec::new(), false,
                     )}
                 }
             }
