@@ -150,6 +150,9 @@ pub struct BookComment {
     /// Per-emoji reaction tallies for this comment (server-populated).
     #[serde(default)]
     pub reactions: Vec<Reaction>,
+    /// Set when this comment is a reply; points at the top-level comment.
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 /// Quick-pick reactions shown in the picker. Any emoji from the keyboard is

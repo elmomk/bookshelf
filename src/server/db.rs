@@ -115,6 +115,14 @@ pub fn init() {
         }
     }
 
+    // Threaded comments: a reply points at its (top-level) parent comment.
+    if let Err(e) = conn.execute("ALTER TABLE book_comments ADD COLUMN parent_id TEXT", []) {
+        let m = e.to_string();
+        if !m.contains("duplicate column") {
+            eprintln!("WARNING: parent_id migration failed: {m}");
+        }
+    }
+
     POOL.set(pool).expect("DB pool already initialized");
 }
 

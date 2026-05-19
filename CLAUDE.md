@@ -24,6 +24,9 @@ spoiler-aware comments. Converted from the Life Manager codebase.
 - **Deploy:** `./scripts/deploy.sh` (build + Docker + deploy + health check). Do NOT use the `/deploy` skill — it targets the unrelated `garmin_api` project.
 - **Screenshots:** `./scripts/screenshot.sh` (Playwright mobile screenshots)
 
+## Deploy Safety (MANDATORY)
+- **Always back up the SQLite DB before any deploy.** `./scripts/deploy.sh` does this automatically (copies `bookclub.db` + WAL/SHM from the running container into `backups/`, keeps last 20, aborts the deploy if the backup fails while the app is running). Never deploy in a way that bypasses this.
+
 ## Git Workflow (MANDATORY)
 - After **every** change set, always `git commit` AND create an annotated tag — without being asked.
 - Commit directly on `main` (this repo uses a direct-to-main release flow; do **not** branch).

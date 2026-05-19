@@ -108,6 +108,9 @@ pub fn BookDetail(id: String) -> Element {
     // Which comment's emoji picker is open, and its input buffer.
     let react_open = use_signal(|| None::<String>);
     let react_buf = use_signal(String::new);
+    // Which top-level comment a reply is being composed for, and its buffer.
+    let reply_to = use_signal(|| None::<String>);
+    let reply_body = use_signal(String::new);
 
     let reload = {
         let book_id = book_id.clone();
@@ -270,7 +273,7 @@ pub fn BookDetail(id: String) -> Element {
             let reload = reload.clone();
             comment_body.set(String::new());
             spawn(async move {
-                if let Err(e) = api::add_comment(book_id, body).await {
+                if let Err(e) = api::add_comment(book_id, body, None).await {
                     error_msg.set(Some(format!("Failed to post: {e}")));
                 }
                 reload();
@@ -636,6 +639,31 @@ pub fn BookDetail(id: String) -> Element {
                                 .filter(|c| filter.is_empty() || c.author == filter)
                                 .cloned()
                                 .collect();
+                            // Thread only when not filtering (a filter would
+                            // orphan replies). roots are newest-first; each
+                            // root's replies are oldest-first.
+                            let threaded = filter.is_empty();
+                            let threads: Vec<(BookComment, Vec<BookComment>)> = if threaded {
+                                visible
+                                    .iter()
+                                    .filter(|c| c.parent_id.is_none())
+                                    .map(|root| {
+                                        let mut kids: Vec<BookComment> = visible
+                                            .iter()
+                                            .filter(|c| {
+                                                c.parent_id.as_deref()
+                                                    == Some(root.id.as_str())
+                                            })
+                                            .cloned()
+                                            .collect();
+                                        kids.reverse();
+                                        (root.clone(), kids)
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            let bid = book_id.clone();
                             rsx! {
                                 if authors.len() > 1 {
                                     div { class: "flex items-center gap-2",
@@ -656,8 +684,14 @@ pub fn BookDetail(id: String) -> Element {
                                         { if comments_snapshot.is_empty() { "No comments yet — start the conversation." } else { "No comments from this person." } }
                                     }
                                 }
-                                for c in visible.iter() {
-                                    {render_comment(c.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf)}
+                                if threaded {
+                                    for (root, kids) in threads.iter() {
+                                        {render_comment(root.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, bid.clone(), reply_to, reply_body, kids.clone(), true)}
+                                    }
+                                } else {
+                                    for c in visible.iter() {
+                                        {render_comment(c.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, bid.clone(), reply_to, reply_body, Vec::new(), false)}
+                                    }
                                 }
                             }
                         }
@@ -904,6 +938,7 @@ fn render_club_row(p: &ReadingProgress, book: &Book) -> Element {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_comment(
     c: BookComment,
     me: String,
@@ -911,6 +946,11 @@ fn render_comment(
     mut error_msg: Signal<Option<String>>,
     react_open: Signal<Option<String>>,
     react_buf: Signal<String>,
+    book_id: String,
+    mut reply_to: Signal<Option<String>>,
+    mut reply_body: Signal<String>,
+    replies: Vec<BookComment>,
+    allow_reply: bool,
 ) -> Element {
     let anchor = match (c.page, c.chapter) {
         (Some(p), Some(ch)) => Some(format!("p.{p} · ch.{ch}")),
@@ -920,9 +960,11 @@ fn render_comment(
     };
     let mine = c.author == me;
     let del_id = c.id.clone();
+    let cid = c.id.clone();
+    let replying = reply_to.read().as_ref() == Some(&cid);
 
-    if c.hidden {
-        return rsx! {
+    let self_box = if c.hidden {
+        rsx! {
             div { class: "rounded-lg border border-cyber-border bg-cyber-dark/60 px-3 py-2",
                 div { class: "flex items-center gap-2",
                     span { class: "text-[11px] text-cyber-dim", "🔒 {c.author}" }
@@ -934,39 +976,115 @@ fn render_comment(
                     "Hidden — past your reading progress. Read further to unlock."
                 }
             }
-        };
-    }
-
-    // Built before the rsx so the delete button below can still move `reload`.
-    let reactions_el = reaction_bar(&c, reload.clone(), error_msg, react_open, react_buf);
-
-    rsx! {
-        div { class: "rounded-lg border border-cyber-border bg-cyber-dark/40 px-3 py-2",
-            div { class: "flex items-center gap-2",
-                span { class: "text-[11px] font-semibold text-neon-green", "{c.author}" }
-                if let Some(a) = &anchor {
-                    span { class: "text-[9px] text-neon-orange/80 border border-neon-orange/30 rounded px-1", "{a}" }
+        }
+    } else {
+        let reactions_el = reaction_bar(&c, reload.clone(), error_msg, react_open, react_buf);
+        let del_reload = reload.clone();
+        rsx! {
+            div { class: "rounded-lg border border-cyber-border bg-cyber-dark/40 px-3 py-2",
+                div { class: "flex items-center gap-2",
+                    span { class: "text-[11px] font-semibold text-neon-green", "{c.author}" }
+                    if let Some(a) = &anchor {
+                        span { class: "text-[9px] text-neon-orange/80 border border-neon-orange/30 rounded px-1", "{a}" }
+                    }
+                    span { class: "text-[9px] text-cyber-dim ml-auto", {format_ago(c.created_at)} }
+                    if mine {
+                        button {
+                            class: "text-neon-magenta text-xs font-bold press-scale",
+                            onclick: move |_| {
+                                let did = del_id.clone();
+                                let mut rl = del_reload.clone();
+                                spawn(async move {
+                                    if let Err(e) = crate::api::books::delete_comment(did).await {
+                                        error_msg.set(Some(format!("Failed: {e}")));
+                                    }
+                                    rl();
+                                });
+                            },
+                            "×"
+                        }
+                    }
                 }
-                span { class: "text-[9px] text-cyber-dim ml-auto", {format_ago(c.created_at)} }
-                if mine {
+                p { class: "text-xs text-cyber-text leading-relaxed mt-1 whitespace-pre-wrap", "{c.body}" }
+                {reactions_el}
+                if allow_reply {
                     button {
-                        class: "text-neon-magenta text-xs font-bold press-scale",
-                        onclick: move |_| {
-                            let did = del_id.clone();
-                            let mut rl = reload.clone();
-                            spawn(async move {
-                                if let Err(e) = crate::api::books::delete_comment(did).await {
-                                    error_msg.set(Some(format!("Failed: {e}")));
+                        r#type: "button",
+                        class: "mt-2 text-[10px] font-bold tracking-wider uppercase text-cyber-dim press-scale",
+                        onclick: {
+                            let cid = cid.clone();
+                            move |_| {
+                                if reply_to.read().as_ref() == Some(&cid) {
+                                    reply_to.set(None);
+                                } else {
+                                    reply_body.set(String::new());
+                                    reply_to.set(Some(cid.clone()));
                                 }
-                                rl();
-                            });
+                            }
                         },
-                        "×"
+                        if replying { "↳ Cancel" } else { "↳ Reply" }
+                    }
+                }
+                if replying {
+                    div { class: "mt-2 space-y-2",
+                        textarea {
+                            class: "w-full bg-cyber-dark border border-cyber-border rounded-lg px-3 py-2 text-sm text-cyber-text outline-none focus:border-neon-orange/60 font-mono resize-none",
+                            rows: "2",
+                            placeholder: "Reply...",
+                            value: "{reply_body}",
+                            oninput: move |e| reply_body.set(e.value()),
+                        }
+                        button {
+                            r#type: "button",
+                            class: "bg-neon-orange/15 border border-neon-orange/40 text-neon-orange rounded-md px-3 py-1 text-[10px] font-bold tracking-wider uppercase press-scale",
+                            onclick: {
+                                let cid = cid.clone();
+                                let book_id = book_id.clone();
+                                let reload = reload.clone();
+                                move |_| {
+                                    let body = reply_body.read().trim().to_string();
+                                    if body.is_empty() {
+                                        return;
+                                    }
+                                    let cid = cid.clone();
+                                    let book_id = book_id.clone();
+                                    let mut rl = reload.clone();
+                                    reply_body.set(String::new());
+                                    reply_to.set(None);
+                                    spawn(async move {
+                                        if let Err(e) = crate::api::books::add_comment(
+                                            book_id,
+                                            body,
+                                            Some(cid),
+                                        )
+                                        .await
+                                        {
+                                            error_msg.set(Some(format!("Failed to post: {e}")));
+                                        }
+                                        rl();
+                                    });
+                                }
+                            },
+                            "POST REPLY"
+                        }
                     }
                 }
             }
-            p { class: "text-xs text-cyber-text leading-relaxed mt-1 whitespace-pre-wrap", "{c.body}" }
-            {reactions_el}
+        }
+    };
+
+    rsx! {
+        {self_box}
+        if !replies.is_empty() {
+            div { class: "ml-4 pl-3 border-l border-cyber-border/60 space-y-2 mt-2",
+                for r in replies.iter() {
+                    {render_comment(
+                        r.clone(), me.clone(), reload.clone(), error_msg,
+                        react_open, react_buf, book_id.clone(),
+                        reply_to, reply_body, Vec::new(), false,
+                    )}
+                }
+            }
         }
     }
 }

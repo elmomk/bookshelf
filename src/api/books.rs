@@ -989,7 +989,7 @@ pub async fn list_comments(book_id: String) -> Result<Vec<BookComment>, ServerFn
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, book_id, author, body, page, chapter, created_at
+            "SELECT id, book_id, author, body, page, chapter, created_at, parent_id
              FROM book_comments WHERE book_id = ?1 ORDER BY created_at DESC",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -1006,6 +1006,7 @@ pub async fn list_comments(book_id: String) -> Result<Vec<BookComment>, ServerFn
                 created_at: row.get(6)?,
                 hidden: false,
                 reactions: Vec::new(),
+                parent_id: row.get(7)?,
             })
         })
         .map_err(|e| ServerFnError::new(e.to_string()))?
@@ -1131,7 +1132,11 @@ pub async fn react_to_comment(
 }
 
 #[server(headers: axum::http::HeaderMap)]
-pub async fn add_comment(book_id: String, body: String) -> Result<(), ServerFnError> {
+pub async fn add_comment(
+    book_id: String,
+    body: String,
+    parent_id: Option<String>,
+) -> Result<(), ServerFnError> {
     use crate::server::{auth, db, validate};
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
@@ -1141,6 +1146,25 @@ pub async fn add_comment(book_id: String, body: String) -> Result<(), ServerFnEr
     }
     validate::text(&body, "comment")?;
     let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    // Replies are flattened to a single level: the parent must exist and be on
+    // this book; if the target is itself a reply, anchor to its root instead.
+    let parent_id: Option<String> = match parent_id {
+        Some(pid) => {
+            let row: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT parent_id FROM book_comments WHERE id = ?1 AND book_id = ?2",
+                    rusqlite::params![pid, book_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            match row {
+                None => return Err(ServerFnError::new("Parent comment not found")),
+                Some(grandparent) => Some(grandparent.unwrap_or(pid)),
+            }
+        }
+        None => None,
+    };
 
     // Every comment is anchored to the commenter's current reading position
     // so spoiler-gating always applies (no opt-in). If they have no progress
@@ -1166,9 +1190,10 @@ pub async fn add_comment(book_id: String, body: String) -> Result<(), ServerFnEr
     let now = chrono::Utc::now().timestamp_millis() as f64;
 
     conn.execute(
-        "INSERT INTO book_comments (id, book_id, author, body, page, chapter, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![id, book_id, me, body, page, chapter, now],
+        "INSERT INTO book_comments
+            (id, book_id, author, body, page, chapter, created_at, parent_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![id, book_id, me, body, page, chapter, now, parent_id],
     )
     .map_err(|e| ServerFnError::new(e.to_string()))?;
 
@@ -1184,13 +1209,27 @@ pub async fn delete_comment(id: String) -> Result<(), ServerFnError> {
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
     let me = auth::display_name_from_headers(&headers);
-    let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    conn.execute(
+    // Deleting a thread root must not orphan its replies: promote them to
+    // top-level first, then delete — atomically.
+    let tx = conn
+        .transaction()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    tx.execute(
+        "UPDATE book_comments SET parent_id = NULL WHERE parent_id = ?1",
+        rusqlite::params![id],
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    tx.execute(
         "DELETE FROM book_comments WHERE id = ?1 AND author = ?2",
         rusqlite::params![id, me],
     )
     .map_err(|e| ServerFnError::new(e.to_string()))?;
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     Ok(())
 }
