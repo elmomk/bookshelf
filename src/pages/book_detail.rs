@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
 
@@ -116,6 +116,8 @@ pub fn BookDetail(id: String) -> Element {
     // Which top-level comment a reply is being composed for, and its buffer.
     let reply_to = use_signal(|| None::<String>);
     let reply_body = use_signal(String::new);
+    // Comments the reader chose to spoil themselves on: id -> fetched body.
+    let revealed = use_signal(HashMap::<String, String>::new);
     // Threads default to collapsed: this is the set of roots the reader has
     // explicitly expanded. Persisted per book so it survives reloads.
     let expanded = {
@@ -725,11 +727,11 @@ pub fn BookDetail(id: String) -> Element {
                                 }
                                 if threaded {
                                     for (root, kids) in threads.iter() {
-                                        {render_comment(root.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, bid.clone(), reply_to, reply_body, expanded, kids.clone(), true)}
+                                        {render_comment(root.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, bid.clone(), reply_to, reply_body, expanded, revealed, kids.clone(), true)}
                                     }
                                 } else {
                                     for c in visible.iter() {
-                                        {render_comment(c.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, bid.clone(), reply_to, reply_body, expanded, Vec::new(), false)}
+                                        {render_comment(c.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, bid.clone(), reply_to, reply_body, expanded, revealed, Vec::new(), false)}
                                     }
                                 }
                             }
@@ -979,7 +981,7 @@ fn render_club_row(p: &ReadingProgress, book: &Book) -> Element {
 
 #[allow(clippy::too_many_arguments)]
 fn render_comment(
-    c: BookComment,
+    mut c: BookComment,
     me: String,
     reload: impl FnMut() + Clone + 'static,
     mut error_msg: Signal<Option<String>>,
@@ -989,9 +991,20 @@ fn render_comment(
     mut reply_to: Signal<Option<String>>,
     mut reply_body: Signal<String>,
     mut expanded: Signal<HashSet<String>>,
+    mut revealed: Signal<HashMap<String, String>>,
     replies: Vec<BookComment>,
     allow_reply: bool,
 ) -> Element {
+    let cid = c.id.clone();
+    // Self-spoil: if the reader chose to reveal this gated comment, swap the
+    // fetched body in and render it like any normal comment.
+    let was_spoiler = c.hidden;
+    if was_spoiler {
+        if let Some(body) = revealed.read().get(&cid).cloned() {
+            c.body = body;
+            c.hidden = false;
+        }
+    }
     let anchor = match (c.page, c.chapter) {
         (Some(p), Some(ch)) => Some(format!("p.{p} · ch.{ch}")),
         (Some(p), None) => Some(format!("p.{p}")),
@@ -1000,7 +1013,6 @@ fn render_comment(
     };
     let mine = c.author == me;
     let del_id = c.id.clone();
-    let cid = c.id.clone();
     let replying = reply_to.read().as_ref() == Some(&cid);
     let reply_count = replies.len();
     let foldable = allow_reply && reply_count > 0;
@@ -1017,6 +1029,28 @@ fn render_comment(
                 }
                 p { class: "text-[11px] text-cyber-dim/70 italic mt-1",
                     "Hidden — past your reading progress. Read further to unlock."
+                }
+                button {
+                    r#type: "button",
+                    class: "mt-2 text-[10px] font-bold tracking-wider uppercase text-neon-orange/80 press-scale",
+                    onclick: {
+                        let cid = cid.clone();
+                        move |_| {
+                            let cid = cid.clone();
+                            spawn(async move {
+                                match crate::api::books::reveal_comment(cid.clone()).await {
+                                    Ok(body) => {
+                                        revealed.with_mut(|m| {
+                                            m.insert(cid, body);
+                                        });
+                                    }
+                                    Err(e) => error_msg
+                                        .set(Some(format!("Couldn't reveal: {e}"))),
+                                }
+                            });
+                        }
+                    },
+                    "👁 Spoil it anyway"
                 }
             }
         }
@@ -1048,6 +1082,24 @@ fn render_comment(
                         }
                     }
                 }
+                if was_spoiler {
+                    div { class: "flex items-center gap-2 mt-1",
+                        span { class: "text-[9px] font-bold tracking-wider uppercase text-neon-orange border border-neon-orange/40 rounded px-1", "⚠ Spoiler" }
+                        button {
+                            r#type: "button",
+                            class: "text-[9px] text-cyber-dim press-scale",
+                            onclick: {
+                                let cid = cid.clone();
+                                move |_| {
+                                    revealed.with_mut(|m| {
+                                        m.remove(&cid);
+                                    });
+                                }
+                            },
+                            "🙈 hide again"
+                        }
+                    }
+                }
                 p { class: "text-xs text-cyber-text leading-relaxed mt-1 whitespace-pre-wrap", "{c.body}" }
                 {reactions_el}
                 if allow_reply {
@@ -1069,7 +1121,7 @@ fn render_comment(
                     }
                 }
                 if replying {
-                    div { class: "mt-2 space-y-2",
+                    div { class: "mt-2 space-y-2 pop-in",
                         textarea {
                             class: "w-full bg-cyber-dark border border-cyber-border rounded-lg px-3 py-2 text-sm text-cyber-text outline-none focus:border-neon-orange/60 font-mono resize-none",
                             rows: "2",
@@ -1169,12 +1221,12 @@ fn render_comment(
     rsx! {
         {self_box}
         if !replies.is_empty() && !is_folded {
-            div { class: "ml-4 pl-3 border-l border-cyber-border/60 space-y-2 mt-2",
+            div { class: "ml-4 pl-3 border-l border-cyber-border/60 space-y-2 mt-2 pop-in",
                 for r in replies.iter() {
                     {render_comment(
                         r.clone(), me.clone(), reload.clone(), error_msg,
                         react_open, react_buf, book_id.clone(),
-                        reply_to, reply_body, expanded, Vec::new(), false,
+                        reply_to, reply_body, expanded, revealed, Vec::new(), false,
                     )}
                 }
             }
@@ -1247,7 +1299,7 @@ fn reaction_bar(
             }
             if open {
                 input {
-                    class: "w-14 bg-cyber-dark border border-neon-cyan/40 rounded-full px-2 py-0.5 text-[13px] text-cyber-text outline-none text-center",
+                    class: "w-14 bg-cyber-dark border border-neon-cyan/40 rounded-full px-2 py-0.5 text-[13px] text-cyber-text outline-none text-center pop-in",
                     r#type: "text",
                     inputmode: "text",
                     autocomplete: "off",

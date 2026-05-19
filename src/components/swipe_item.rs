@@ -15,6 +15,21 @@ fn haptic_tick() {
 #[cfg(not(target_arch = "wasm32"))]
 fn haptic_tick() {}
 
+#[cfg(target_arch = "wasm32")]
+fn now_ms() -> f64 {
+    js_sys::Date::now()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> f64 {
+    0.0
+}
+
+/// Flick velocity (px/ms) that dismisses regardless of distance, and the
+/// minimum travel before a flick counts (ignores tiny accidental moves).
+const FLICK_VELOCITY: f64 = 0.11;
+const FLICK_MIN_PX: f64 = 8.0;
+
 #[component]
 pub fn SwipeItem(
     children: Element,
@@ -30,6 +45,7 @@ pub fn SwipeItem(
     let mut is_horizontal = use_signal(|| false);
     let mut animating = use_signal(|| false);
     let mut threshold_crossed = use_signal(|| false);
+    let mut start_time = use_signal(|| 0.0_f64);
 
     let opacity = if completed { "opacity-40" } else { "" };
     let line_through = if completed { "line-through decoration-cyber-dim/50" } else { "" };
@@ -76,6 +92,7 @@ pub fn SwipeItem(
                         is_horizontal.set(false);
                         animating.set(false);
                         threshold_crossed.set(false);
+                        start_time.set(now_ms());
                     }
                 },
                 ontouchmove: move |e| {
@@ -119,16 +136,23 @@ pub fn SwipeItem(
                     swiping.set(false);
                     animating.set(true);
                     let tx = *translate_x.read();
+                    let dt = (now_ms() - *start_time.read()).max(1.0);
+                    let velocity = tx.abs() / dt;
+                    let flick = tx.abs() > FLICK_MIN_PX && velocity > FLICK_VELOCITY;
 
-                    if tx > THRESHOLD {
+                    if (tx > THRESHOLD || (tx > 0.0 && flick)) && on_swipe_right.is_some() {
+                        // Fly out the way it was swiped (spatial consistency),
+                        // then the parent's reload removes the row.
+                        translate_x.set(800.0);
                         if let Some(ref handler) = on_swipe_right {
                             handler.call(());
                         }
-                    } else if tx < -THRESHOLD {
+                    } else if tx < -THRESHOLD || (tx < 0.0 && flick) {
+                        translate_x.set(-800.0);
                         on_swipe_left.call(());
+                    } else {
+                        translate_x.set(0.0);
                     }
-
-                    translate_x.set(0.0);
                 },
                 {children}
             }

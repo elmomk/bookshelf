@@ -218,6 +218,7 @@ fn render_book_card(
 ) -> Element {
     let nav = navigator();
     let id_for_nav = book.id.clone();
+    let card_key = book.id.clone();
 
     let my_status = book
         .my_progress
@@ -268,6 +269,7 @@ fn render_book_card(
 
     rsx! {
         SwipeItem {
+            key: "{card_key}",
             on_swipe_right: Some(EventHandler::new(on_right)),
             on_swipe_left: EventHandler::new(on_left),
             completed: cur_status == ReadingStatus::Finished,

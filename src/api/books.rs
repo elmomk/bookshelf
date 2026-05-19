@@ -1131,6 +1131,25 @@ pub async fn react_to_comment(
     Ok(())
 }
 
+/// Fetch a comment's full body, bypassing spoiler-gating. Called only when
+/// the reader explicitly chooses to spoil themselves, so the body stays off
+/// the wire until then.
+#[server(headers: axum::http::HeaderMap)]
+pub async fn reveal_comment(id: String) -> Result<String, ServerFnError> {
+    use crate::server::{auth, db};
+
+    auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
+    let conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    conn.query_row(
+        "SELECT body FROM book_comments WHERE id = ?1",
+        rusqlite::params![id],
+        |r| r.get::<_, String>(0),
+    )
+    .map_err(|_| ServerFnError::new("Comment not found"))
+}
+
 #[server(headers: axum::http::HeaderMap)]
 pub async fn add_comment(
     book_id: String,

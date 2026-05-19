@@ -8,11 +8,13 @@ pub fn ProgressBar(watched: i32, total: i32) -> Element {
         0.0
     };
 
+    // Animate transform (GPU: no layout/paint) instead of width.
+    let frac = pct / 100.0;
     rsx! {
         div { class: "w-full h-1.5 bg-cyber-dark rounded-full overflow-hidden",
             div {
-                class: "h-full rounded-full transition-[width] duration-200 [transition-timing-function:cubic-bezier(0.23,1,0.32,1)] {color_class(pct)}",
-                style: "width: {pct}%",
+                class: "h-full w-full rounded-full origin-left transition-transform duration-200 [transition-timing-function:cubic-bezier(0.23,1,0.32,1)] {color_class(pct)}",
+                style: "transform: scaleX({frac})",
             }
         }
     }
