@@ -1080,8 +1080,16 @@ fn reaction_bar(
                 input {
                     class: "w-14 bg-cyber-dark border border-neon-cyan/40 rounded-full px-2 py-0.5 text-[13px] text-cyber-text outline-none text-center",
                     r#type: "text",
-                    autofocus: true,
+                    inputmode: "text",
                     autocomplete: "off",
+                    // `autofocus` only fires on initial page load, not for a
+                    // dynamically-inserted input, so the soft keyboard never
+                    // opened. Focus it explicitly the moment it mounts.
+                    onmounted: move |e| {
+                        spawn(async move {
+                            let _ = e.set_focus(true).await;
+                        });
+                    },
                     value: "{react_buf}",
                     placeholder: "🙂",
                     oninput: {
