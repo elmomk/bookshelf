@@ -1144,7 +1144,7 @@ pub async fn add_comment(
     if body.trim().is_empty() {
         return Err(ServerFnError::new("Comment cannot be empty"));
     }
-    validate::text(&body, "comment")?;
+    validate::comment(&body)?;
     let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
 
     // Replies are flattened to a single level: the parent must exist and be on

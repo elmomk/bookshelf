@@ -7,7 +7,10 @@ use crate::cache::{self, SyncStatus};
 use crate::components::error_banner::ErrorBanner;
 use crate::components::layout::SyncTrigger;
 use crate::components::progress_bar::ProgressBar;
-use crate::models::{Book, BookComment, ReadingProgress, ReadingStatus, TocEntry, REACTION_EMOJIS};
+use crate::models::{
+    Book, BookComment, ReadingProgress, ReadingStatus, TocEntry, COMMENT_MAX_CHARS,
+    REACTION_EMOJIS,
+};
 use crate::route::Route;
 
 /// Multi-select file picker that returns a JSON array of image data URLs via
@@ -279,14 +282,25 @@ pub fn BookDetail(id: String) -> Element {
             if body.is_empty() {
                 return;
             }
+            let len = body.chars().count();
+            if len > COMMENT_MAX_CHARS {
+                error_msg.set(Some(format!(
+                    "Comment is too long — {len} / {COMMENT_MAX_CHARS} characters. Trim it and try again."
+                )));
+                return;
+            }
             let book_id = book_id.clone();
             let reload = reload.clone();
-            comment_body.set(String::new());
             spawn(async move {
-                if let Err(e) = api::add_comment(book_id, body, None).await {
-                    error_msg.set(Some(format!("Failed to post: {e}")));
+                // Only clear the box once it actually posted — never lose
+                // the user's text to a failed/offline request.
+                match api::add_comment(book_id, body, None).await {
+                    Ok(()) => {
+                        comment_body.set(String::new());
+                        reload();
+                    }
+                    Err(e) => error_msg.set(Some(format!("Failed to post: {e}"))),
                 }
-                reload();
             });
         }
     };
@@ -608,6 +622,21 @@ pub fn BookDetail(id: String) -> Element {
                         div { class: "flex items-center gap-2 flex-wrap",
                             span { class: "text-[9px] text-cyber-dim",
                                 "🔖 Auto-anchored to your current section — hidden from readers behind you."
+                            }
+                            {
+                                let used = comment_body.read().chars().count();
+                                rsx! {
+                                    if used > COMMENT_MAX_CHARS.saturating_sub(200) {
+                                        span {
+                                            class: if used > COMMENT_MAX_CHARS {
+                                                "ml-auto text-[9px] font-mono text-neon-orange"
+                                            } else {
+                                                "ml-auto text-[9px] font-mono text-cyber-dim"
+                                            },
+                                            "{used}/{COMMENT_MAX_CHARS}"
+                                        }
+                                    }
+                                }
                             }
                             button {
                                 r#type: "button",
@@ -1048,6 +1077,21 @@ fn render_comment(
                             value: "{reply_body}",
                             oninput: move |e| reply_body.set(e.value()),
                         }
+                        {
+                            let used = reply_body.read().chars().count();
+                            rsx! {
+                                if used > COMMENT_MAX_CHARS.saturating_sub(200) {
+                                    span {
+                                        class: if used > COMMENT_MAX_CHARS {
+                                            "text-[9px] font-mono text-neon-orange"
+                                        } else {
+                                            "text-[9px] font-mono text-cyber-dim"
+                                        },
+                                        "{used}/{COMMENT_MAX_CHARS}"
+                                    }
+                                }
+                            }
+                        }
                         button {
                             r#type: "button",
                             class: "bg-neon-orange/15 border border-neon-orange/40 text-neon-orange rounded-md px-3 py-1 text-[10px] font-bold tracking-wider uppercase press-scale",
@@ -1060,22 +1104,35 @@ fn render_comment(
                                     if body.is_empty() {
                                         return;
                                     }
+                                    let len = body.chars().count();
+                                    if len > COMMENT_MAX_CHARS {
+                                        error_msg.set(Some(format!(
+                                            "Reply is too long — {len} / {COMMENT_MAX_CHARS} characters. Trim it and try again."
+                                        )));
+                                        return;
+                                    }
                                     let cid = cid.clone();
                                     let book_id = book_id.clone();
                                     let mut rl = reload.clone();
-                                    reply_body.set(String::new());
-                                    reply_to.set(None);
                                     spawn(async move {
-                                        if let Err(e) = crate::api::books::add_comment(
+                                        // Clear only on success — keep the
+                                        // draft if the post fails.
+                                        match crate::api::books::add_comment(
                                             book_id,
                                             body,
                                             Some(cid),
                                         )
                                         .await
                                         {
-                                            error_msg.set(Some(format!("Failed to post: {e}")));
+                                            Ok(()) => {
+                                                reply_body.set(String::new());
+                                                reply_to.set(None);
+                                                rl();
+                                            }
+                                            Err(e) => error_msg.set(Some(
+                                                format!("Failed to post: {e}"),
+                                            )),
                                         }
-                                        rl();
                                     });
                                 }
                             },

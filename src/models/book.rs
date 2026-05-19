@@ -159,6 +159,10 @@ pub struct BookComment {
 /// allowed; these are just convenient shortcuts.
 pub const REACTION_EMOJIS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
 
+/// Max length (characters) of a comment or reply body. Generous enough for a
+/// real book-club paragraph, still bounded.
+pub const COMMENT_MAX_CHARS: usize = 4000;
+
 /// Aggregated reaction count for one emoji on one comment.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Reaction {
