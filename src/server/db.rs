@@ -123,6 +123,20 @@ pub fn init() {
         }
     }
 
+    // Soft-delete (powers Undo): instead of DELETE we set deleted_at = now;
+    // list_* queries filter it out. Undo clears the column.
+    for sql in [
+        "ALTER TABLE books ADD COLUMN deleted_at REAL",
+        "ALTER TABLE book_comments ADD COLUMN deleted_at REAL",
+    ] {
+        if let Err(e) = conn.execute(sql, []) {
+            let m = e.to_string();
+            if !m.contains("duplicate column") {
+                eprintln!("WARNING: deleted_at migration failed: {m}");
+            }
+        }
+    }
+
     POOL.set(pool).expect("DB pool already initialized");
 }
 

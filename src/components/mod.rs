@@ -6,3 +6,4 @@ pub mod error_banner;
 pub mod sync_indicator;
 pub mod progress_bar;
 pub mod notification_bell;
+pub mod undo_toast;

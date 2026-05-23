@@ -5,8 +5,10 @@ use crate::cache::{self, SyncStatus};
 use crate::components::error_banner::ErrorBanner;
 use crate::components::layout::SyncTrigger;
 use crate::components::swipe_item::SwipeItem;
+use crate::components::undo_toast::UndoToast;
 use crate::models::{Book, BookSearchResult, ReadingStatus};
 use crate::route::Route;
+use crate::util::anim_sleep;
 
 #[component]
 pub fn Books() -> Element {
@@ -15,6 +17,9 @@ pub fn Books() -> Element {
     let mut search_results = use_signal(Vec::<BookSearchResult>::new);
     let mut searching = use_signal(|| false);
     let mut error_msg = use_signal(|| None::<String>);
+    // Undo state for the last book removal (token, id, label).
+    let undo_target = use_signal(|| None::<(u64, String, String)>);
+    let undo_seq = use_signal(|| 0_u64);
 
     let mut sync_status = use_context::<Signal<SyncStatus>>();
     let sync_trigger = use_context::<Signal<SyncTrigger>>();
@@ -144,7 +149,7 @@ pub fn Books() -> Element {
             // Shelf
             div { class: "space-y-0",
                 for book in books.read().iter() {
-                    {render_book_card(book.clone(), reload, error_msg)}
+                    {render_book_card(book.clone(), reload, error_msg, undo_target, undo_seq)}
                 }
                 if books.read().is_empty() {
                     div { class: "text-center py-16",
@@ -160,6 +165,21 @@ pub fn Books() -> Element {
                     }
                 }
             }
+        }
+        UndoToast {
+            target: undo_target,
+            on_undo: {
+                let reload = reload.clone();
+                move |id: String| {
+                    let rl = reload.clone();
+                    spawn(async move {
+                        if let Err(e) = api::undo_delete_book(id).await {
+                            error_msg.set(Some(format!("Undo failed: {e}")));
+                        }
+                        rl();
+                    });
+                }
+            },
         }
     }
 }
@@ -215,6 +235,8 @@ fn render_book_card(
     book: Book,
     reload: impl FnMut() + Clone + 'static,
     mut error_msg: Signal<Option<String>>,
+    mut undo_target: Signal<Option<(u64, String, String)>>,
+    mut undo_seq: Signal<u64>,
 ) -> Element {
     let nav = navigator();
     let id_for_nav = book.id.clone();
@@ -246,17 +268,47 @@ fn render_book_card(
         });
     };
 
-    // swipe left → remove from shelf
+    // swipe left → soft-remove from shelf with Undo
     let reload_l = reload.clone();
     let del_id = book.id.clone();
+    let del_title = book.title.clone();
     let on_left = move |_| {
         let bid = del_id.clone();
+        let title = del_title.clone();
         let mut rl = reload_l.clone();
         spawn(async move {
-            if let Err(e) = api::delete_book(bid).await {
-                error_msg.set(Some(format!("Failed to delete: {e}")));
+            match api::delete_book(bid.clone()).await {
+                Ok(()) => {
+                    // Bump the token first, capture it, then schedule a
+                    // delayed clear that only fires if no newer delete has
+                    // replaced this toast.
+                    let tok = {
+                        let mut s = undo_seq.write();
+                        *s += 1;
+                        *s
+                    };
+                    undo_target.set(Some((
+                        tok,
+                        bid,
+                        format!("📖 “{title}” removed"),
+                    )));
+                    rl();
+                    spawn(async move {
+                        anim_sleep(6000).await;
+                        let still_mine = undo_target
+                            .read()
+                            .as_ref()
+                            .is_some_and(|(t, _, _)| *t == tok);
+                        if still_mine {
+                            undo_target.set(None);
+                        }
+                    });
+                }
+                Err(e) => {
+                    error_msg.set(Some(format!("Failed to delete: {e}")));
+                    rl();
+                }
             }
-            rl();
         });
     };
 

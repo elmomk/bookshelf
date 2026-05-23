@@ -85,7 +85,7 @@ pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
         .prepare(
             "SELECT id, title, author, cover_url, total_pages, total_chapters,
                     description, google_books_id, isbn, added_by, created_at, toc_json
-             FROM books ORDER BY created_at DESC",
+             FROM books WHERE deleted_at IS NULL ORDER BY created_at DESC",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let mut books: Vec<Book> = stmt
@@ -379,12 +379,33 @@ pub async fn delete_book(id: String) -> Result<(), ServerFnError> {
         )
         .ok();
 
-    conn.execute("DELETE FROM books WHERE id = ?1", rusqlite::params![id])
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    // Soft-delete so Undo can restore it; the row + cascaded children stay.
+    let now = chrono::Utc::now().timestamp_millis() as f64;
+    conn.execute(
+        "UPDATE books SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+        rusqlite::params![now, id],
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     if let Some(t) = title {
         crate::server::notify::create_notification(&me, "deleted", "books", &t);
     }
+    Ok(())
+}
+
+/// Restore a soft-deleted book.
+#[server(headers: axum::http::HeaderMap)]
+pub async fn undo_delete_book(id: String) -> Result<(), ServerFnError> {
+    use crate::server::{auth, db};
+    auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
+    let conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    conn.execute(
+        "UPDATE books SET deleted_at = NULL WHERE id = ?1",
+        rusqlite::params![id],
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(())
 }
 
@@ -990,7 +1011,9 @@ pub async fn list_comments(book_id: String) -> Result<Vec<BookComment>, ServerFn
     let mut stmt = conn
         .prepare(
             "SELECT id, book_id, author, body, page, chapter, created_at, parent_id
-             FROM book_comments WHERE book_id = ?1 ORDER BY created_at DESC",
+             FROM book_comments
+             WHERE book_id = ?1 AND deleted_at IS NULL
+             ORDER BY created_at DESC",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
@@ -1228,28 +1251,37 @@ pub async fn delete_comment(id: String) -> Result<(), ServerFnError> {
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
     let me = auth::display_name_from_headers(&headers);
-    let mut conn = db::pool()
+    let conn = db::pool()
         .get()
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    // Deleting a thread root must not orphan its replies: promote them to
-    // top-level first, then delete — atomically.
-    let tx = conn
-        .transaction()
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    tx.execute(
-        "UPDATE book_comments SET parent_id = NULL WHERE parent_id = ?1",
-        rusqlite::params![id],
+    // Soft-delete so Undo can restore it. Replies stay in the table but are
+    // hidden from the rendered tree (their parent is now filtered out); on
+    // undo they reattach to the restored root naturally.
+    let now = chrono::Utc::now().timestamp_millis() as f64;
+    conn.execute(
+        "UPDATE book_comments SET deleted_at = ?1
+         WHERE id = ?2 AND author = ?3 AND deleted_at IS NULL",
+        rusqlite::params![now, id, me],
     )
     .map_err(|e| ServerFnError::new(e.to_string()))?;
-    tx.execute(
-        "DELETE FROM book_comments WHERE id = ?1 AND author = ?2",
+    Ok(())
+}
+
+/// Restore a soft-deleted comment (only its original author).
+#[server(headers: axum::http::HeaderMap)]
+pub async fn undo_delete_comment(id: String) -> Result<(), ServerFnError> {
+    use crate::server::{auth, db};
+    auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
+    let me = auth::display_name_from_headers(&headers);
+    let conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    conn.execute(
+        "UPDATE book_comments SET deleted_at = NULL WHERE id = ?1 AND author = ?2",
         rusqlite::params![id, me],
     )
     .map_err(|e| ServerFnError::new(e.to_string()))?;
-    tx.commit()
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
     Ok(())
 }
 

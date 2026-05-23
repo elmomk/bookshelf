@@ -4,9 +4,11 @@ use dioxus::prelude::*;
 
 use crate::api::books as api;
 use crate::cache::{self, SyncStatus};
+use crate::util::anim_sleep;
 use crate::components::error_banner::ErrorBanner;
 use crate::components::layout::SyncTrigger;
 use crate::components::progress_bar::ProgressBar;
+use crate::components::undo_toast::UndoToast;
 use crate::models::{
     Book, BookComment, ReadingProgress, ReadingStatus, TocEntry, COMMENT_MAX_CHARS,
     REACTION_EMOJIS,
@@ -120,6 +122,9 @@ pub fn BookDetail(id: String) -> Element {
     let reply_body = use_signal(String::new);
     // Comments the reader chose to spoil themselves on: id -> fetched body.
     let revealed = use_signal(HashMap::<String, String>::new);
+    // Undo state for the last comment deletion: (token, comment_id, label).
+    let undo_target = use_signal(|| None::<(u64, String, String)>);
+    let undo_seq = use_signal(|| 0_u64);
     // Threads default to collapsed: this is the set of roots the reader has
     // explicitly expanded. Persisted per book so it survives reloads.
     let expanded = {
@@ -729,11 +734,11 @@ pub fn BookDetail(id: String) -> Element {
                                 }
                                 if threaded {
                                     for (root, kids) in threads.iter() {
-                                        {render_comment(root.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, react_closing, bid.clone(), reply_to, reply_body, expanded, revealed, kids.clone(), true)}
+                                        {render_comment(root.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, react_closing, bid.clone(), reply_to, reply_body, expanded, revealed, undo_target, undo_seq, kids.clone(), true)}
                                     }
                                 } else {
                                     for c in visible.iter() {
-                                        {render_comment(c.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, react_closing, bid.clone(), reply_to, reply_body, expanded, revealed, Vec::new(), false)}
+                                        {render_comment(c.clone(), me_now.clone(), reload.clone(), error_msg, react_open, react_buf, react_closing, bid.clone(), reply_to, reply_body, expanded, revealed, undo_target, undo_seq, Vec::new(), false)}
                                     }
                                 }
                             }
@@ -745,6 +750,21 @@ pub fn BookDetail(id: String) -> Element {
                     p { class: "text-xs tracking-[0.3em] uppercase text-cyber-dim", "Book not found" }
                 }
             }
+        }
+        UndoToast {
+            target: undo_target,
+            on_undo: {
+                let reload = reload.clone();
+                move |id: String| {
+                    let rl = reload.clone();
+                    spawn(async move {
+                        if let Err(e) = api::undo_delete_comment(id).await {
+                            error_msg.set(Some(format!("Undo failed: {e}")));
+                        }
+                        rl();
+                    });
+                }
+            },
         }
     }
 }
@@ -995,6 +1015,8 @@ fn render_comment(
     mut reply_body: Signal<String>,
     mut expanded: Signal<HashSet<String>>,
     mut revealed: Signal<HashMap<String, String>>,
+    mut undo_target: Signal<Option<(u64, String, String)>>,
+    mut undo_seq: Signal<u64>,
     replies: Vec<BookComment>,
     allow_reply: bool,
 ) -> Element {
@@ -1075,10 +1097,35 @@ fn render_comment(
                                 let did = del_id.clone();
                                 let mut rl = del_reload.clone();
                                 spawn(async move {
-                                    if let Err(e) = crate::api::books::delete_comment(did).await {
-                                        error_msg.set(Some(format!("Failed: {e}")));
+                                    match crate::api::books::delete_comment(did.clone()).await {
+                                        Ok(()) => {
+                                            let tok = {
+                                                let mut s = undo_seq.write();
+                                                *s += 1;
+                                                *s
+                                            };
+                                            undo_target.set(Some((
+                                                tok,
+                                                did,
+                                                "💬 Comment removed".to_string(),
+                                            )));
+                                            rl();
+                                            spawn(async move {
+                                                anim_sleep(6000).await;
+                                                let still_mine = undo_target
+                                                    .read()
+                                                    .as_ref()
+                                                    .is_some_and(|(t, _, _)| *t == tok);
+                                                if still_mine {
+                                                    undo_target.set(None);
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            error_msg.set(Some(format!("Failed: {e}")));
+                                            rl();
+                                        }
                                     }
-                                    rl();
                                 });
                             },
                             "×"
@@ -1229,7 +1276,7 @@ fn render_comment(
                     {render_comment(
                         r.clone(), me.clone(), reload.clone(), error_msg,
                         react_open, react_buf, react_closing, book_id.clone(),
-                        reply_to, reply_body, expanded, revealed, Vec::new(), false,
+                        reply_to, reply_body, expanded, revealed, undo_target, undo_seq, Vec::new(), false,
                     )}
                 }
             }
@@ -1399,18 +1446,6 @@ fn reaction_bar(
         }
     }
 }
-
-/// Await `ms` milliseconds (used to keep an exiting element mounted just long
-/// enough for its CSS exit animation). Uses the existing eval bridge so no
-/// timer crate is needed; a no-op on the server.
-#[cfg(target_arch = "wasm32")]
-async fn anim_sleep(ms: u32) {
-    let mut e = document::eval(&format!("setTimeout(() => dioxus.send(0), {ms})"));
-    let _ = e.recv::<i32>().await;
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-async fn anim_sleep(_ms: u32) {}
 
 fn format_ago(created_at: f64) -> String {
     #[cfg(target_arch = "wasm32")]

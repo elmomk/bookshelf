@@ -4,6 +4,7 @@ mod models;
 mod pages;
 mod route;
 mod api;
+mod util;
 #[cfg(not(target_arch = "wasm32"))]
 mod server;
 
