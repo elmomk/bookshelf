@@ -4,6 +4,7 @@ use crate::api::settings as api;
 use crate::cache;
 use crate::components::error_banner::ErrorBanner;
 use crate::components::layout::SyncTrigger;
+use crate::models::{SnapshotBook, SnapshotInfo};
 
 #[component]
 pub fn Settings() -> Element {
@@ -13,6 +14,14 @@ pub fn Settings() -> Element {
     let mut saving = use_signal(|| false);
     let mut error_msg = use_signal(|| None::<String>);
     let mut saved = use_signal(|| false);
+
+    // History state.
+    let mut snapshots = use_signal(Vec::<SnapshotInfo>::new);
+    let mut history_busy = use_signal(|| false);
+    // The snapshot id whose "Restore everything" is one tap away from firing.
+    let mut confirm_full: Signal<Option<String>> = use_signal(|| None);
+    // The snapshot id whose per-book picker is expanded, with its book list.
+    let mut pick_for: Signal<Option<(String, Vec<SnapshotBook>)>> = use_signal(|| None);
 
     let mut sync_trigger = use_context::<Signal<SyncTrigger>>();
 
@@ -28,6 +37,9 @@ pub fn Settings() -> Element {
                 }
                 Err(e) => error_msg.set(Some(format!("Failed to load: {e}"))),
             }
+            if let Ok(list) = api::list_snapshots().await {
+                snapshots.set(list);
+            }
         });
     });
 
@@ -41,7 +53,6 @@ pub fn Settings() -> Element {
                     current.set(name.clone());
                     cache::write("me", &name);
                     saved.set(true);
-                    // Nudge other pages to re-sync under the new identity.
                     let cur = sync_trigger.read().0;
                     sync_trigger.set(SyncTrigger(cur + 1));
                 }
@@ -61,9 +72,28 @@ pub fn Settings() -> Element {
         apply.clone()(String::new());
     };
 
+    let take_snapshot = move |_| {
+        spawn(async move {
+            history_busy.set(true);
+            error_msg.set(None);
+            match api::create_snapshot().await {
+                Ok(info) => {
+                    let mut v = snapshots.read().clone();
+                    v.insert(0, info);
+                    snapshots.set(v);
+                }
+                Err(e) => error_msg.set(Some(format!("Snapshot failed: {e}"))),
+            }
+            history_busy.set(false);
+        });
+    };
+
     let cur = current.read().clone();
     let def = default_name.read().clone();
     let has_alias = !cur.is_empty() && cur != def;
+    let snaps = snapshots.read().clone();
+    let confirm_id_now = confirm_full.read().clone();
+    let pick_now = pick_for.read().clone();
 
     rsx! {
         div { class: "px-4 py-4 space-y-4",
@@ -118,6 +148,208 @@ pub fn Settings() -> Element {
                     }
                 }
             }
+
+            div { class: "bg-cyber-card/80 border border-cyber-border rounded-xl p-4 space-y-3",
+                p { class: "text-[10px] text-neon-purple tracking-[0.2em] uppercase font-bold", "History" }
+                p { class: "text-[9px] text-cyber-dim leading-relaxed",
+                    "Snapshots are point-in-time backups of the whole shelf. Restore everything at once, or roll a single book back without touching the others. Every restore quietly takes a fresh snapshot first so it's reversible."
+                }
+
+                button {
+                    r#type: "button",
+                    class: "w-full bg-neon-purple/15 border border-neon-purple/40 text-neon-purple rounded-lg px-3 py-2 text-[10px] font-bold tracking-wider uppercase press-scale disabled:opacity-50",
+                    disabled: *history_busy.read(),
+                    onclick: take_snapshot,
+                    { if *history_busy.read() { "TAKING…" } else { "📸 Take snapshot now" } }
+                }
+
+                if snaps.is_empty() {
+                    p { class: "text-xs text-cyber-dim text-center py-2", "No snapshots yet." }
+                }
+                for s in snaps.iter() {
+                    {
+                        let info = s.clone();
+                        let id = info.id.clone();
+                        let id_for_full = id.clone();
+                        let id_for_pick = id.clone();
+                        let id_for_delete = id.clone();
+                        let label_id = id.clone();
+                        let ts_label = format_ts(info.created_at);
+                        let size_label = format_size(info.size_bytes);
+                        let is_confirm = confirm_id_now.as_deref() == Some(id.as_str());
+                        let pick_open = pick_now.as_ref().map(|(i, _)| i.as_str()) == Some(id.as_str());
+                        rsx! {
+                            div { class: "border border-cyber-border rounded-lg p-3 space-y-2",
+                                div { class: "flex items-baseline justify-between gap-2",
+                                    span { class: "text-xs text-neon-cyan font-mono", "{ts_label}" }
+                                    span { class: "text-[9px] text-cyber-dim font-mono", "{size_label}" }
+                                }
+                                div { class: "flex flex-wrap gap-2 text-[10px] text-cyber-dim",
+                                    span { "📚 {info.books} books" }
+                                    span { "💬 {info.comments} comments" }
+                                    span { "👍 {info.reactions} reactions" }
+                                }
+                                div { class: "flex flex-col gap-1 pt-1",
+                                    button {
+                                        r#type: "button",
+                                        class: if is_confirm {
+                                            "w-full bg-neon-magenta/20 border border-neon-magenta text-neon-magenta rounded-md px-3 py-2 text-[10px] font-bold tracking-wider uppercase press-scale"
+                                        } else {
+                                            "w-full bg-cyber-dark border border-cyber-border text-cyber-text rounded-md px-3 py-2 text-[10px] font-bold tracking-wider uppercase press-scale"
+                                        },
+                                        disabled: *history_busy.read(),
+                                        onclick: {
+                                            let id = id_for_full.clone();
+                                            let mut sync_trigger = sync_trigger;
+                                            move |_| {
+                                                let id = id.clone();
+                                                let am_confirming = confirm_full.read().as_deref() == Some(id.as_str());
+                                                if !am_confirming {
+                                                    confirm_full.set(Some(id));
+                                                    return;
+                                                }
+                                                confirm_full.set(None);
+                                                spawn(async move {
+                                                    history_busy.set(true);
+                                                    error_msg.set(None);
+                                                    match api::restore_full_from_snapshot(id).await {
+                                                        Ok(()) => {
+                                                            if let Ok(list) = api::list_snapshots().await {
+                                                                snapshots.set(list);
+                                                            }
+                                                            let cur = sync_trigger.read().0;
+                                                            sync_trigger.set(SyncTrigger(cur + 1));
+                                                        }
+                                                        Err(e) => error_msg.set(Some(format!("Restore failed: {e}"))),
+                                                    }
+                                                    history_busy.set(false);
+                                                });
+                                            }
+                                        },
+                                        { if is_confirm { "Tap again to wipe & restore" } else { "↺ Restore everything" } }
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        class: "w-full bg-cyber-dark border border-cyber-border text-cyber-dim rounded-md px-3 py-2 text-[10px] font-bold tracking-wider uppercase press-scale disabled:opacity-50",
+                                        disabled: *history_busy.read(),
+                                        onclick: {
+                                            let id = id_for_pick.clone();
+                                            move |_| {
+                                                let already = pick_for.read().as_ref().map(|(i, _)| i == &id).unwrap_or(false);
+                                                if already {
+                                                    pick_for.set(None);
+                                                    return;
+                                                }
+                                                let id2 = id.clone();
+                                                spawn(async move {
+                                                    history_busy.set(true);
+                                                    match api::list_books_in_snapshot(id2.clone()).await {
+                                                        Ok(books) => pick_for.set(Some((id2, books))),
+                                                        Err(e) => error_msg.set(Some(format!("Couldn't read snapshot: {e}"))),
+                                                    }
+                                                    history_busy.set(false);
+                                                });
+                                            }
+                                        },
+                                        { if pick_open { "× Close book picker" } else { "📖 Restore one book…" } }
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        "aria-label": "Delete snapshot",
+                                        class: "w-full text-[9px] text-cyber-dim/60 tracking-wider uppercase press-scale",
+                                        onclick: {
+                                            let id = id_for_delete.clone();
+                                            let label = label_id.clone();
+                                            move |_| {
+                                                let id = id.clone();
+                                                let label = label.clone();
+                                                spawn(async move {
+                                                    if let Err(e) = api::delete_snapshot(id).await {
+                                                        error_msg.set(Some(format!("Couldn't delete {label}: {e}")));
+                                                        return;
+                                                    }
+                                                    let mut v = snapshots.read().clone();
+                                                    v.retain(|s| s.id != label);
+                                                    snapshots.set(v);
+                                                });
+                                            }
+                                        },
+                                        "Delete snapshot"
+                                    }
+                                }
+                                if pick_open {
+                                    {
+                                        let books = pick_now
+                                            .as_ref()
+                                            .map(|(_, b)| b.clone())
+                                            .unwrap_or_default();
+                                        rsx! {
+                                            div { class: "pop-in pt-1 space-y-1 border-t border-cyber-border/60",
+                                                if books.is_empty() {
+                                                    p { class: "text-[10px] text-cyber-dim py-1", "This snapshot has no books." }
+                                                }
+                                                for b in books.iter() {
+                                                    {
+                                                        let book = b.clone();
+                                                        let snap_id = id.clone();
+                                                        let mut sync_trigger = sync_trigger;
+                                                        rsx! {
+                                                            button {
+                                                                r#type: "button",
+                                                                class: "w-full flex flex-col items-start text-left bg-cyber-dark border border-cyber-border rounded-md px-2 py-1.5 text-[11px] text-cyber-text press-scale disabled:opacity-50",
+                                                                disabled: *history_busy.read(),
+                                                                onclick: move |_| {
+                                                                    let snap_id = snap_id.clone();
+                                                                    let book = book.clone();
+                                                                    spawn(async move {
+                                                                        history_busy.set(true);
+                                                                        error_msg.set(None);
+                                                                        match api::restore_book_from_snapshot(snap_id, book.id.clone()).await {
+                                                                            Ok(()) => {
+                                                                                pick_for.set(None);
+                                                                                let cur = sync_trigger.read().0;
+                                                                                sync_trigger.set(SyncTrigger(cur + 1));
+                                                                            }
+                                                                            Err(e) => error_msg.set(Some(format!("Restore failed: {e}"))),
+                                                                        }
+                                                                        history_busy.set(false);
+                                                                    });
+                                                                },
+                                                                span { class: "font-semibold", "{book.title}" }
+                                                                if let Some(a) = &book.author {
+                                                                    span { class: "text-[9px] text-cyber-dim", "{a}" }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+}
+
+/// `2026-05-23 03:14` from a unix-millis timestamp.
+fn format_ts(ms: f64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// Human-friendly file size.
+fn format_size(b: u64) -> String {
+    if b >= 1_048_576 {
+        format!("{:.1}M", b as f64 / 1_048_576.0)
+    } else if b >= 1024 {
+        format!("{}K", b / 1024)
+    } else {
+        format!("{b}B")
     }
 }
