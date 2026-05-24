@@ -71,6 +71,103 @@ async fn fetch_ol_toc(isbn: &str) -> Option<String> {
     serde_json::to_string(&entries).ok()
 }
 
+/// Best-effort table-of-contents lookup from Google Books by volume id.
+/// `volumeInfo.tableOfContents` is publisher-supplied (Onix) — uncommon but
+/// real. Falls back to mining `description` for chapter-like lines so we get
+/// *something* useful when the publisher didn't ship a ToC.
+#[cfg(not(target_arch = "wasm32"))]
+async fn fetch_google_toc(google_id: &str) -> Option<String> {
+    let id = google_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let mut url = format!("https://www.googleapis.com/books/v1/volumes/{id}");
+    if let Ok(key) = std::env::var("GOOGLE_BOOKS_API_KEY") {
+        if !key.is_empty() {
+            url.push_str(&format!("?key={key}"));
+        }
+    }
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let vol = json.get("volumeInfo")?;
+
+    // 1) Structured publisher-supplied table of contents.
+    if let Some(toc_str) = vol.get("tableOfContents").and_then(|v| v.as_str()) {
+        let entries: Vec<TocEntry> = toc_str
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .take(1000)
+            .map(|l| TocEntry {
+                title: l.chars().take(200).collect(),
+                label: None,
+                page: None,
+                level: 0,
+            })
+            .collect();
+        if !entries.is_empty() {
+            return serde_json::to_string(&entries).ok();
+        }
+    }
+
+    // 2) Fallback: mine the description for chapter-like lines.
+    let desc = vol.get("description").and_then(|v| v.as_str())?;
+    let entries: Vec<TocEntry> = desc
+        .split(|c: char| c == '\n' || c == '\r' || c == '|' || c == '•' || c == '·')
+        .map(|s| s.trim())
+        .filter(|l| (3..=200).contains(&l.len()) && looks_like_chapter(l))
+        .take(300)
+        .map(|l| TocEntry {
+            title: l.chars().take(200).collect(),
+            label: None,
+            page: None,
+            level: 0,
+        })
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&entries).ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn looks_like_chapter(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if lower.starts_with("chapter ")
+        || lower.starts_with("part ")
+        || lower.starts_with("book ")
+        || lower.starts_with("section ")
+    {
+        return true;
+    }
+    // "1." / "12:" / "3) " style numbered entries.
+    let mut it = line.chars().peekable();
+    let mut saw_digit = false;
+    while matches!(it.peek(), Some(c) if c.is_ascii_digit()) {
+        it.next();
+        saw_digit = true;
+    }
+    if !saw_digit {
+        return false;
+    }
+    match (it.next(), it.next()) {
+        (Some(sep), Some(' ')) if matches!(sep, '.' | ':' | ')') => true,
+        _ => false,
+    }
+}
+
 // --- Shelf ---
 
 #[server(headers: axum::http::HeaderMap)]
@@ -418,23 +515,32 @@ pub async fn refresh_toc(book_id: String) -> Result<bool, ServerFnError> {
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
     let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let isbn: Option<String> = conn
+    let (isbn, gid): (Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT isbn FROM books WHERE id = ?1",
+            "SELECT isbn, google_books_id FROM books WHERE id = ?1",
             rusqlite::params![book_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|_| ServerFnError::new("Book not found"))?;
 
-    let Some(isbn) = isbn.filter(|s| !s.trim().is_empty()) else {
-        return Ok(false);
-    };
+    // Try Open Library first (richer ToC when present), then Google Books
+    // (Onix `tableOfContents` if shipped, else a best-effort scan of the
+    // description). First non-empty result wins.
+    let mut toc: Option<String> = None;
+    if let Some(i) = isbn.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        toc = fetch_ol_toc(i).await;
+    }
+    if toc.is_none() {
+        if let Some(g) = gid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            toc = fetch_google_toc(g).await;
+        }
+    }
 
-    match fetch_ol_toc(&isbn).await {
-        Some(toc) => {
+    match toc {
+        Some(t) => {
             conn.execute(
                 "UPDATE books SET toc_json = ?1 WHERE id = ?2",
-                rusqlite::params![toc, book_id],
+                rusqlite::params![t, book_id],
             )
             .map_err(|e| ServerFnError::new(e.to_string()))?;
             Ok(true)

@@ -365,6 +365,8 @@ pub fn BookDetail(id: String) -> Element {
                     {
                         let toc = book.toc();
                         let has_isbn = book.isbn.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+                        let has_gid = book.google_books_id.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+                        let can_fetch = has_isbn || has_gid;
                         let on_refresh = {
                             let book_id = book_id.clone();
                             let reload = reload.clone();
@@ -375,7 +377,7 @@ pub fn BookDetail(id: String) -> Element {
                                     match api::refresh_toc(book_id).await {
                                         Ok(true) => {}
                                         Ok(false) => error_msg.set(Some(
-                                            "No chapter list found on Open Library for this book.".to_string(),
+                                            "No chapter list found on Open Library or Google Books for this book.".to_string(),
                                         )),
                                         Err(e) => error_msg.set(Some(format!("Lookup failed: {e}"))),
                                     }
@@ -390,7 +392,7 @@ pub fn BookDetail(id: String) -> Element {
                         let clear_book_id = book_id.clone();
                         let clear_reload = reload.clone();
                         rsx! {
-                            { toc_selector(toc.clone(), has_isbn, edit_page, edit_chapter, on_refresh, on_jump) }
+                            { toc_selector(toc.clone(), can_fetch, edit_page, edit_chapter, on_refresh, on_jump) }
                             button {
                                 r#type: "button",
                                 class: "w-full bg-cyber-dark border border-cyber-border text-neon-purple/80 rounded-lg px-3 py-2 text-[10px] font-bold tracking-wider uppercase press-scale",
@@ -905,7 +907,7 @@ fn num_select(label_text: &str, max: i32, mut value: Signal<String>) -> Element 
 
 fn toc_selector(
     toc: Vec<TocEntry>,
-    has_isbn: bool,
+    can_fetch: bool,
     mut edit_page: Signal<String>,
     mut edit_chapter: Signal<String>,
     on_refresh: EventHandler<()>,
@@ -953,13 +955,13 @@ fn toc_selector(
                 }
             }
         }
-    } else if has_isbn {
+    } else if can_fetch {
         rsx! {
             button {
                 r#type: "button",
                 class: "w-full bg-cyber-dark border border-cyber-border text-cyber-dim rounded-lg px-3 py-2 text-[10px] font-bold tracking-wider uppercase press-scale",
                 onclick: move |_| on_refresh.call(()),
-                "↻ Fetch chapter list (Open Library)"
+                "↻ Fetch chapter list (Open Library + Google)"
             }
         }
     } else {
