@@ -91,7 +91,7 @@ toolchain in the image). SQLite lives in a Docker volume.
 |---------|---------|
 | `DATABASE_PATH` | SQLite location (default `bookclub.db`) |
 | `REQUIRE_AUTH` | Require the Tailscale identity header when `true` |
-| `GOOGLE_BOOKS_API_KEY` | Optional — search works keyless (rate-limited) |
+| `GOOGLE_BOOKS_API_KEY` | **Required.** Google now caps the keyless Books API at 0 queries/day, so without it book search and the Google-Books ToC fallback both fail. Make one in a Google Cloud project with Books API enabled. |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | Enable web-push notifications |
 
 ## License

@@ -40,7 +40,7 @@ spoiler-aware comments. Converted from the Life Manager codebase.
 - App at `https://bookclub.tail6c1af7.ts.net/`
 - SQLite DB in Docker volume at `/app/data/bookclub.db`
 - `DATABASE_PATH` env var configures DB location (defaults to `bookclub.db`)
-- `GOOGLE_BOOKS_API_KEY` is optional (search works keyless, just rate-limited)
+- `GOOGLE_BOOKS_API_KEY` is **effectively required** as of 2026-05 — Google now caps the keyless anonymous Books API quota at 0/day (HTTP 429), so without a key book search and the Google-Books ToC fallback both silently return no results. Get a key from a Google Cloud project with the Books API enabled, then put it in the container env. Open Library calls (ToC by ISBN) are unaffected and stay keyless.
 - `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` enable web-push notifications
 
 ## Data Model
