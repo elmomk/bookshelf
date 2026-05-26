@@ -364,15 +364,17 @@ pub async fn search_books(query: String) -> Result<Vec<BookSearchResult>, Server
 
 #[server(headers: axum::http::HeaderMap)]
 pub async fn add_book(result: BookSearchResult) -> Result<String, ServerFnError> {
-    use crate::server::{auth, db, validate};
+    use crate::server::{auth, changelog, db, validate};
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
     let me = auth::display_name_from_headers(&headers);
     validate::text(&result.title, "title")?;
-    let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    // De-dupe by Google Books id — the shelf is shared.
+    // Fast-path de-dupe by Google Books id — the shelf is shared.
     if !result.google_books_id.is_empty() {
+        let conn = db::pool()
+            .get()
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
         let existing: Option<String> = conn
             .query_row(
                 "SELECT id FROM books WHERE google_books_id = ?1",
@@ -390,14 +392,48 @@ pub async fn add_book(result: BookSearchResult) -> Result<String, ServerFnError>
     let gbid = if result.google_books_id.is_empty() {
         None
     } else {
-        Some(result.google_books_id)
+        Some(result.google_books_id.clone())
     };
 
-    conn.execute(
+    // Best-effort ToC enrichment BEFORE the write tx so the network fetch
+    // never holds the IMMEDIATE write lock.
+    let toc: Option<String> = if let Some(isbn) = result.isbn.as_deref() {
+        fetch_ol_toc(isbn).await
+    } else {
+        None
+    };
+
+    let mut conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    // Re-check de-dupe inside the tx in case another writer raced us.
+    if let Some(ref g) = gbid {
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT id FROM books WHERE google_books_id = ?1",
+                rusqlite::params![g],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(eid) = existing {
+            return Ok(eid);
+        }
+    }
+
+    let short_title: String = result.title.chars().take(40).collect();
+    let label = format!("add_book({short_title})");
+    let rec = changelog::ChangeRecorder::begin(&tx, Some(me.clone()), Some(label))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.execute(
         "INSERT INTO books
             (id, title, author, cover_url, total_pages, total_chapters,
-             description, google_books_id, isbn, added_by, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10)",
+             description, google_books_id, isbn, added_by, created_at, toc_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             id,
             result.title,
@@ -408,20 +444,18 @@ pub async fn add_book(result: BookSearchResult) -> Result<String, ServerFnError>
             gbid,
             result.isbn,
             me,
-            now
+            now,
+            toc,
         ],
     )
     .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    // Best-effort: enrich with a chapter list from Open Library (never fails the add).
-    if let Some(isbn) = result.isbn.as_deref() {
-        if let Some(toc) = fetch_ol_toc(isbn).await {
-            let _ = conn.execute(
-                "UPDATE books SET toc_json = ?1 WHERE id = ?2",
-                rusqlite::params![toc, id],
-            );
-        }
-    }
+    let pk: &[&dyn rusqlite::ToSql] = &[&id];
+    rec.record_insert("books", pk)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     crate::server::notify::create_notification(&me, "added", "books", &result.title);
     Ok(id)
@@ -434,7 +468,7 @@ pub async fn add_book_manual(
     total_pages: Option<i32>,
     total_chapters: Option<i32>,
 ) -> Result<String, ServerFnError> {
-    use crate::server::{auth, db, validate};
+    use crate::server::{auth, changelog, db, validate};
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
     let me = auth::display_name_from_headers(&headers);
@@ -442,12 +476,22 @@ pub async fn add_book_manual(
     if title.trim().is_empty() {
         return Err(ServerFnError::new("Title is required"));
     }
-    let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp_millis() as f64;
 
-    conn.execute(
+    let short_title: String = title.chars().take(40).collect();
+    let label = format!("add_book_manual({short_title})");
+    let rec = changelog::ChangeRecorder::begin(&tx, Some(me.clone()), Some(label))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.execute(
         "INSERT INTO books
             (id, title, author, cover_url, total_pages, total_chapters,
              description, google_books_id, isbn, added_by, created_at)
@@ -456,19 +500,32 @@ pub async fn add_book_manual(
     )
     .map_err(|e| ServerFnError::new(e.to_string()))?;
 
+    let pk: &[&dyn rusqlite::ToSql] = &[&id];
+    rec.record_insert("books", pk)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
     crate::server::notify::create_notification(&me, "added", "books", &title);
     Ok(id)
 }
 
 #[server(headers: axum::http::HeaderMap)]
 pub async fn delete_book(id: String) -> Result<(), ServerFnError> {
-    use crate::server::{auth, db};
+    use crate::server::{auth, changelog, db};
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
     let me = auth::display_name_from_headers(&headers);
-    let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let title: Option<String> = conn
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let title: Option<String> = tx
         .query_row(
             "SELECT title FROM books WHERE id = ?1",
             rusqlite::params![id],
@@ -476,13 +533,24 @@ pub async fn delete_book(id: String) -> Result<(), ServerFnError> {
         )
         .ok();
 
-    // Soft-delete so Undo can restore it; the row + cascaded children stay.
+    let cid_short: String = id.chars().take(8).collect();
+    let label = format!("delete_book({cid_short})");
+    let rec = changelog::ChangeRecorder::begin(&tx, Some(me.clone()), Some(label))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
     let now = chrono::Utc::now().timestamp_millis() as f64;
-    conn.execute(
-        "UPDATE books SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
-        rusqlite::params![now, id],
-    )
+    let pk: &[&dyn rusqlite::ToSql] = &[&id];
+    rec.record_update_with("books", pk, |t| {
+        t.execute(
+            "UPDATE books SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            rusqlite::params![now, id],
+        )
+        .map(|_| ())
+    })
     .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     if let Some(t) = title {
         crate::server::notify::create_notification(&me, "deleted", "books", &t);
@@ -493,16 +561,33 @@ pub async fn delete_book(id: String) -> Result<(), ServerFnError> {
 /// Restore a soft-deleted book.
 #[server(headers: axum::http::HeaderMap)]
 pub async fn undo_delete_book(id: String) -> Result<(), ServerFnError> {
-    use crate::server::{auth, db};
+    use crate::server::{auth, changelog, db};
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
-    let conn = db::pool()
+    let me = auth::display_name_from_headers(&headers);
+    let mut conn = db::pool()
         .get()
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    conn.execute(
-        "UPDATE books SET deleted_at = NULL WHERE id = ?1",
-        rusqlite::params![id],
-    )
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let cid_short: String = id.chars().take(8).collect();
+    let label = format!("undo_delete_book({cid_short})");
+    let rec = changelog::ChangeRecorder::begin(&tx, Some(me), Some(label))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let pk: &[&dyn rusqlite::ToSql] = &[&id];
+    rec.record_update_with("books", pk, |t| {
+        t.execute(
+            "UPDATE books SET deleted_at = NULL WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map(|_| ())
+    })
     .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(())
 }
 
@@ -510,22 +595,25 @@ pub async fn undo_delete_book(id: String) -> Result<(), ServerFnError> {
 /// Returns true if a chapter list was found and stored.
 #[server(headers: axum::http::HeaderMap)]
 pub async fn refresh_toc(book_id: String) -> Result<bool, ServerFnError> {
-    use crate::server::{auth, db};
+    use crate::server::{auth, changelog, db};
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
-    let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
+    let me = auth::display_name_from_headers(&headers);
 
-    let (isbn, gid): (Option<String>, Option<String>) = conn
-        .query_row(
+    let (isbn, gid): (Option<String>, Option<String>) = {
+        let conn = db::pool()
+            .get()
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        conn.query_row(
             "SELECT isbn, google_books_id FROM books WHERE id = ?1",
             rusqlite::params![book_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .map_err(|_| ServerFnError::new("Book not found"))?;
+        .map_err(|_| ServerFnError::new("Book not found"))?
+    };
 
-    // Try Open Library first (richer ToC when present), then Google Books
-    // (Onix `tableOfContents` if shipped, else a best-effort scan of the
-    // description). First non-empty result wins.
+    // Network fetches BEFORE any write tx so the IMMEDIATE lock isn't held
+    // across a slow HTTP call.
     let mut toc: Option<String> = None;
     if let Some(i) = isbn.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         toc = fetch_ol_toc(i).await;
@@ -536,17 +624,35 @@ pub async fn refresh_toc(book_id: String) -> Result<bool, ServerFnError> {
         }
     }
 
-    match toc {
-        Some(t) => {
-            conn.execute(
-                "UPDATE books SET toc_json = ?1 WHERE id = ?2",
-                rusqlite::params![t, book_id],
-            )
-            .map_err(|e| ServerFnError::new(e.to_string()))?;
-            Ok(true)
-        }
-        None => Ok(false),
-    }
+    let Some(toc_json) = toc else {
+        return Ok(false);
+    };
+
+    let mut conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let cid_short: String = book_id.chars().take(8).collect();
+    let label = format!("refresh_toc({cid_short})");
+    let rec = changelog::ChangeRecorder::begin(&tx, Some(me), Some(label))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let pk: &[&dyn rusqlite::ToSql] = &[&book_id];
+    rec.record_update_with("books", pk, |t| {
+        t.execute(
+            "UPDATE books SET toc_json = ?1 WHERE id = ?2",
+            rusqlite::params![toc_json, book_id],
+        )
+        .map(|_| ())
+    })
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(true)
 }
 
 /// Manually set (or clear) the shared chapter/section list for a book.
@@ -554,12 +660,27 @@ pub async fn refresh_toc(book_id: String) -> Result<bool, ServerFnError> {
 /// sees the dropdown.
 #[server(headers: axum::http::HeaderMap)]
 pub async fn set_toc(book_id: String, entries: Vec<TocEntry>) -> Result<(), ServerFnError> {
-    use crate::server::{auth, db};
+    use crate::server::{auth, changelog, db};
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
-    let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
+    let me = auth::display_name_from_headers(&headers);
+    if entries.len() > 1000 {
+        return Err(ServerFnError::new("Too many entries (max 1000)"));
+    }
+    let json: Option<String> = if entries.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&entries).map_err(|e| ServerFnError::new(e.to_string()))?)
+    };
 
-    let exists: bool = conn
+    let mut conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let exists: bool = tx
         .query_row(
             "SELECT COUNT(*) > 0 FROM books WHERE id = ?1",
             rusqlite::params![book_id],
@@ -569,22 +690,24 @@ pub async fn set_toc(book_id: String, entries: Vec<TocEntry>) -> Result<(), Serv
     if !exists {
         return Err(ServerFnError::new("Book not found"));
     }
-    if entries.len() > 1000 {
-        return Err(ServerFnError::new("Too many entries (max 1000)"));
-    }
 
-    let json: Option<String> = if entries.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&entries).map_err(|e| ServerFnError::new(e.to_string()))?)
-    };
+    let cid_short: String = book_id.chars().take(8).collect();
+    let label = format!("set_toc({}, n={})", cid_short, entries.len());
+    let rec = changelog::ChangeRecorder::begin(&tx, Some(me), Some(label))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    conn.execute(
-        "UPDATE books SET toc_json = ?1 WHERE id = ?2",
-        rusqlite::params![json, book_id],
-    )
+    let pk: &[&dyn rusqlite::ToSql] = &[&book_id];
+    rec.record_update_with("books", pk, |t| {
+        t.execute(
+            "UPDATE books SET toc_json = ?1 WHERE id = ?2",
+            rusqlite::params![json, book_id],
+        )
+        .map(|_| ())
+    })
     .map_err(|e| ServerFnError::new(e.to_string()))?;
 
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(())
 }
 
@@ -1042,13 +1165,18 @@ pub async fn set_reading_progress(
     current_chapter: Option<i32>,
     status: ReadingStatus,
 ) -> Result<(), ServerFnError> {
-    use crate::server::{auth, db};
+    use crate::server::{auth, changelog, db};
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
     let me = auth::display_name_from_headers(&headers);
-    let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let title: String = conn
+    let title: String = tx
         .query_row(
             "SELECT title FROM books WHERE id = ?1",
             rusqlite::params![book_id],
@@ -1056,32 +1184,63 @@ pub async fn set_reading_progress(
         )
         .map_err(|_| ServerFnError::new("Book not found"))?;
 
-    let prev: Option<String> = conn
+    // Look up the existing row (if any) by composite (book_id, reader); the
+    // PK is `id` so we need that id to record the change correctly. Branching
+    // INSERT vs UPDATE rather than UPSERT keeps the recorder unambiguous.
+    let existing: Option<(String, String)> = tx
         .query_row(
-            "SELECT status FROM reading_progress WHERE book_id = ?1 AND reader = ?2",
+            "SELECT id, status FROM reading_progress WHERE book_id = ?1 AND reader = ?2",
             rusqlite::params![book_id, me],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .ok();
+    let prev_status_str: Option<String> = existing.as_ref().map(|(_, s)| s.clone());
+    let row_id: String = existing
+        .map(|(id, _)| id)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp_millis() as f64;
     let status_str = status.to_string();
+    let short_title: String = title.chars().take(30).collect();
+    let label = format!("set_reading_progress({short_title} → {status_str})");
+    let rec = changelog::ChangeRecorder::begin(&tx, Some(me.clone()), Some(label))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    conn.execute(
-        "INSERT INTO reading_progress
-            (id, book_id, reader, current_page, current_chapter, status, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(book_id, reader) DO UPDATE SET
-            current_page = ?4,
-            current_chapter = ?5,
-            status = ?6,
-            updated_at = ?7",
-        rusqlite::params![id, book_id, me, current_page, current_chapter, status_str, now],
-    )
+    let pk: &[&dyn rusqlite::ToSql] = &[&row_id];
+    let was_existing = prev_status_str.is_some();
+    rec.record_update_with("reading_progress", pk, |t| {
+        if was_existing {
+            t.execute(
+                "UPDATE reading_progress
+                 SET current_page = ?2, current_chapter = ?3, status = ?4, updated_at = ?5
+                 WHERE id = ?1",
+                rusqlite::params![row_id, current_page, current_chapter, status_str, now],
+            )
+            .map(|_| ())
+        } else {
+            t.execute(
+                "INSERT INTO reading_progress
+                    (id, book_id, reader, current_page, current_chapter, status, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    row_id,
+                    book_id,
+                    me,
+                    current_page,
+                    current_chapter,
+                    status_str,
+                    now
+                ],
+            )
+            .map(|_| ())
+        }
+    })
     .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let prev_status = prev.map(|s| ReadingStatus::from_str(&s));
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let prev_status = prev_status_str.map(|s| ReadingStatus::from_str(&s));
     match status {
         ReadingStatus::Finished if prev_status.as_ref() != Some(&ReadingStatus::Finished) => {
             crate::server::notify::create_notification(&me, "finished", "books", &title);
@@ -1314,7 +1473,7 @@ pub async fn add_comment(
     body: String,
     parent_id: Option<String>,
 ) -> Result<(), ServerFnError> {
-    use crate::server::{auth, db, validate};
+    use crate::server::{auth, changelog, db, validate};
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
     let me = auth::display_name_from_headers(&headers);
@@ -1322,13 +1481,19 @@ pub async fn add_comment(
         return Err(ServerFnError::new("Comment cannot be empty"));
     }
     validate::comment(&body)?;
-    let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let mut conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     // Replies are flattened to a single level: the parent must exist and be on
     // this book; if the target is itself a reply, anchor to its root instead.
     let parent_id: Option<String> = match parent_id {
         Some(pid) => {
-            let row: Option<Option<String>> = conn
+            let row: Option<Option<String>> = tx
                 .query_row(
                     "SELECT parent_id FROM book_comments WHERE id = ?1 AND book_id = ?2",
                     rusqlite::params![pid, book_id],
@@ -1346,7 +1511,7 @@ pub async fn add_comment(
     // Every comment is anchored to the commenter's current reading position
     // so spoiler-gating always applies (no opt-in). If they have no progress
     // yet, it stays unanchored (visible to all).
-    let (page, chapter): (Option<i32>, Option<i32>) = conn
+    let (page, chapter): (Option<i32>, Option<i32>) = tx
         .query_row(
             "SELECT current_page, current_chapter FROM reading_progress
              WHERE book_id = ?1 AND reader = ?2",
@@ -1355,7 +1520,7 @@ pub async fn add_comment(
         )
         .unwrap_or((None, None));
 
-    let title: Option<String> = conn
+    let title: Option<String> = tx
         .query_row(
             "SELECT title FROM books WHERE id = ?1",
             rusqlite::params![book_id],
@@ -1366,13 +1531,25 @@ pub async fn add_comment(
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp_millis() as f64;
 
-    conn.execute(
+    let preview: String = body.chars().take(40).collect();
+    let label = format!("add_comment(\"{preview}\")");
+    let rec = changelog::ChangeRecorder::begin(&tx, Some(me.clone()), Some(label))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.execute(
         "INSERT INTO book_comments
             (id, book_id, author, body, page, chapter, created_at, parent_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![id, book_id, me, body, page, chapter, now, parent_id],
     )
     .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let pk: &[&dyn rusqlite::ToSql] = &[&id];
+    rec.record_insert("book_comments", pk)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     if let Some(t) = title {
         crate::server::notify::create_notification(&me, "commented on", "books", &t);
@@ -1382,41 +1559,72 @@ pub async fn add_comment(
 
 #[server(headers: axum::http::HeaderMap)]
 pub async fn delete_comment(id: String) -> Result<(), ServerFnError> {
-    use crate::server::{auth, db};
+    use crate::server::{auth, changelog, db};
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
     let me = auth::display_name_from_headers(&headers);
-    let conn = db::pool()
+    let mut conn = db::pool()
         .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let cid_short: String = id.chars().take(8).collect();
+    let label = format!("delete_comment({cid_short})");
+    let rec = changelog::ChangeRecorder::begin(&tx, Some(me.clone()), Some(label))
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
     // Soft-delete so Undo can restore it. Replies stay in the table but are
     // hidden from the rendered tree (their parent is now filtered out); on
     // undo they reattach to the restored root naturally.
     let now = chrono::Utc::now().timestamp_millis() as f64;
-    conn.execute(
-        "UPDATE book_comments SET deleted_at = ?1
-         WHERE id = ?2 AND author = ?3 AND deleted_at IS NULL",
-        rusqlite::params![now, id, me],
-    )
+    let pk: &[&dyn rusqlite::ToSql] = &[&id];
+    rec.record_update_with("book_comments", pk, |t| {
+        t.execute(
+            "UPDATE book_comments SET deleted_at = ?1
+             WHERE id = ?2 AND author = ?3 AND deleted_at IS NULL",
+            rusqlite::params![now, id, me],
+        )
+        .map(|_| ())
+    })
     .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(())
 }
 
 /// Restore a soft-deleted comment (only its original author).
 #[server(headers: axum::http::HeaderMap)]
 pub async fn undo_delete_comment(id: String) -> Result<(), ServerFnError> {
-    use crate::server::{auth, db};
+    use crate::server::{auth, changelog, db};
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
     let me = auth::display_name_from_headers(&headers);
-    let conn = db::pool()
+    let mut conn = db::pool()
         .get()
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    conn.execute(
-        "UPDATE book_comments SET deleted_at = NULL WHERE id = ?1 AND author = ?2",
-        rusqlite::params![id, me],
-    )
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let cid_short: String = id.chars().take(8).collect();
+    let label = format!("undo_delete_comment({cid_short})");
+    let rec = changelog::ChangeRecorder::begin(&tx, Some(me.clone()), Some(label))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let pk: &[&dyn rusqlite::ToSql] = &[&id];
+    rec.record_update_with("book_comments", pk, |t| {
+        t.execute(
+            "UPDATE book_comments SET deleted_at = NULL WHERE id = ?1 AND author = ?2",
+            rusqlite::params![id, me],
+        )
+        .map(|_| ())
+    })
     .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(())
 }
 

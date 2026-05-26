@@ -95,19 +95,41 @@ pub async fn mark_notifications_read() -> Result<(), ServerFnError> {
 
 #[server(headers: axum::http::HeaderMap)]
 pub async fn set_notification_enabled(enabled: bool) -> Result<(), ServerFnError> {
-    use crate::server::{auth, db};
+    use crate::server::{auth, changelog, db};
 
     auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
     let display_name = auth::display_name_from_headers(&headers);
-    let conn = db::pool().get().map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    conn.execute(
-        "INSERT INTO notification_settings (user_name, enabled) VALUES (?1, ?2)
-         ON CONFLICT(user_name) DO UPDATE SET enabled = ?2",
-        rusqlite::params![display_name, enabled as i32],
-    )
+    let label = format!(
+        "set_notification_enabled({})",
+        if enabled { "on" } else { "off" }
+    );
+    let rec =
+        changelog::ChangeRecorder::begin(&tx, Some(display_name.clone()), Some(label))
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    // Branch the UPSERT so the recorder logs a clean INSERT or UPDATE.
+    let pk: &[&dyn rusqlite::ToSql] = &[&display_name];
+    rec.record_update_with("notification_settings", pk, |t| {
+        // record_update_with falls back to INSERT logging if the row didn't
+        // exist before; either way we just run the UPSERT here.
+        t.execute(
+            "INSERT INTO notification_settings (user_name, enabled) VALUES (?1, ?2)
+             ON CONFLICT(user_name) DO UPDATE SET enabled = ?2",
+            rusqlite::params![display_name, enabled as i32],
+        )
+        .map(|_| ())
+    })
     .map_err(|e| ServerFnError::new(e.to_string()))?;
 
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(())
 }
 

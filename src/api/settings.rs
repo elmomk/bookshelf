@@ -80,19 +80,38 @@ pub async fn set_alias(alias: String) -> Result<String, ServerFnError> {
         }
     }
 
+    let preview_label = if alias.is_empty() {
+        format!("set_alias({old} → default)")
+    } else {
+        format!("set_alias({old} → {alias})")
+    };
+    let rec = crate::server::changelog::ChangeRecorder::begin(
+        &tx,
+        Some(old.clone()),
+        Some(preview_label),
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let pk: &[&dyn rusqlite::ToSql] = &[&login];
     let new_name = if alias.is_empty() {
-        tx.execute(
-            "DELETE FROM reader_aliases WHERE login = ?1",
-            rusqlite::params![login],
-        )
+        rec.record_update_with("reader_aliases", pk, |t| {
+            t.execute(
+                "DELETE FROM reader_aliases WHERE login = ?1",
+                rusqlite::params![login],
+            )
+            .map(|_| ())
+        })
         .map_err(|e| ServerFnError::new(e.to_string()))?;
         auth::base_name_from_headers(&headers)
     } else {
-        tx.execute(
-            "INSERT INTO reader_aliases (login, alias, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(login) DO UPDATE SET alias = ?2, updated_at = ?3",
-            rusqlite::params![login, alias, now],
-        )
+        rec.record_update_with("reader_aliases", pk, |t| {
+            t.execute(
+                "INSERT INTO reader_aliases (login, alias, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(login) DO UPDATE SET alias = ?2, updated_at = ?3",
+                rusqlite::params![login, alias, now],
+            )
+            .map(|_| ())
+        })
         .map_err(|e| ServerFnError::new(e.to_string()))?;
         alias.clone()
     };
@@ -101,17 +120,43 @@ pub async fn set_alias(alias: String) -> Result<String, ServerFnError> {
         // `OR IGNORE` on the uniquely-keyed tables: if the new name already has
         // a row (alias collides with another identity) keep the existing one
         // rather than aborting.
-        for sql in [
+        //
+        // These bulk renames are NOT logged row-by-row — they could touch
+        // hundreds of rows and the canonical record of the decision is the
+        // `reader_aliases` change above. The high-level event below summarizes
+        // the rewrite; an alias-undo should be implemented as a re-run of
+        // set_alias with the old name, not as per-row inverse-replay.
+        let mut affected: [i64; 6] = [0; 6];
+        for (i, sql) in [
             "UPDATE OR IGNORE reading_progress SET reader = ?1 WHERE reader = ?2",
             "UPDATE book_comments SET author = ?1 WHERE author = ?2",
             "UPDATE notifications SET actor = ?1 WHERE actor = ?2",
             "UPDATE OR IGNORE notification_reads SET user_name = ?1 WHERE user_name = ?2",
             "UPDATE OR IGNORE notification_settings SET user_name = ?1 WHERE user_name = ?2",
             "UPDATE push_subscriptions SET user_name = ?1 WHERE user_name = ?2",
-        ] {
-            tx.execute(sql, rusqlite::params![new_name, old])
-                .map_err(|e| ServerFnError::new(e.to_string()))?;
+        ]
+        .iter()
+        .enumerate()
+        {
+            affected[i] = tx
+                .execute(sql, rusqlite::params![new_name, old])
+                .map_err(|e| ServerFnError::new(e.to_string()))?
+                as i64;
         }
+
+        let details = serde_json::json!({
+            "old": old,
+            "new": new_name,
+            "reading_progress": affected[0],
+            "book_comments": affected[1],
+            "notifications": affected[2],
+            "notification_reads": affected[3],
+            "notification_settings": affected[4],
+            "push_subscriptions": affected[5],
+        })
+        .to_string();
+        rec.record_event("alias_rewrite", None, None, Some(details))
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
     }
 
     tx.commit()
