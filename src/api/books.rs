@@ -1224,11 +1224,15 @@ pub async fn react_to_comment(
         return Err(ServerFnError::new("Invalid reaction"));
     }
 
-    let conn = db::pool()
+    let mut conn = db::pool()
         .get()
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let exists: bool = conn
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let exists: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM book_comments WHERE id = ?1)",
             rusqlite::params![comment_id],
@@ -1239,24 +1243,49 @@ pub async fn react_to_comment(
         return Err(ServerFnError::new("Comment not found"));
     }
 
-    let removed = conn
-        .execute(
-            "DELETE FROM comment_reactions
-             WHERE comment_id = ?1 AND reader = ?2 AND emoji = ?3",
+    // Toggle. Recorder captures the resulting INSERT or DELETE in the same tx.
+    let already: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM comment_reactions
+                           WHERE comment_id = ?1 AND reader = ?2 AND emoji = ?3)",
             rusqlite::params![comment_id, me, emoji],
+            |r| r.get(0),
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    if removed == 0 {
+    let cid_short = comment_id.chars().take(8).collect::<String>();
+    let label = format!(
+        "react_to_comment({}{} on {})",
+        if already { "-" } else { "+" },
+        emoji,
+        cid_short,
+    );
+    let rec = crate::server::changelog::ChangeRecorder::begin(
+        &tx,
+        Some(me.clone()),
+        Some(label),
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let pk: &[&dyn rusqlite::ToSql] = &[&comment_id, &me, &emoji];
+    if already {
+        // record_delete runs the DELETE itself after capturing old_json.
+        rec.record_delete("comment_reactions", pk)
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+    } else {
         let now = chrono::Utc::now().timestamp_millis() as f64;
-        conn.execute(
+        tx.execute(
             "INSERT INTO comment_reactions (comment_id, reader, emoji, created_at)
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![comment_id, me, emoji, now],
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
+        rec.record_insert("comment_reactions", pk)
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
     }
 
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(())
 }
 
