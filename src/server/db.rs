@@ -160,6 +160,10 @@ pub fn init() {
         }
     }
 
+    // Keep the change log bounded (~50k rows). Fire-and-forget: a prune
+    // failure is non-fatal; the log just grows until the next init.
+    crate::server::changelog::prune_oldest(&conn);
+
     POOL.set(pool).expect("DB pool already initialized");
 }
 

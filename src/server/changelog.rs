@@ -106,6 +106,21 @@ pub fn next_tx_id(tx: &Transaction) -> rusqlite::Result<i64> {
     )
 }
 
+/// Soft cap for `db_changes` rows. ~500 bytes/row at the high end → 25 MB.
+pub const MAX_CHANGES: i64 = 50_000;
+
+/// Fire-and-forget prune: keep the newest `MAX_CHANGES` rows, delete the rest.
+/// Called from `db::init` after the migration runs.
+pub fn prune_oldest(conn: &rusqlite::Connection) {
+    let _ = conn.execute(
+        "DELETE FROM db_changes
+         WHERE id IN (
+             SELECT id FROM db_changes ORDER BY id DESC LIMIT -1 OFFSET ?1
+         )",
+        rusqlite::params![MAX_CHANGES],
+    );
+}
+
 /// Captures row-level pre/post state for every write inside the wrapping tx.
 pub struct ChangeRecorder<'tx> {
     tx: &'tx Transaction<'tx>,
@@ -786,6 +801,36 @@ mod tests {
             )
             .unwrap();
         tx.commit().unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn defer_foreign_keys_lets_us_replay_in_any_order() {
+        // Confirms the primitive that restore_to_before_tx relies on:
+        // with PRAGMA defer_foreign_keys = ON, FK checks happen at commit,
+        // so inverse-INSERTs and inverse-DELETEs across parent/child tables
+        // can land in whichever id-order the change log dictates.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE parent(id TEXT PRIMARY KEY);
+             CREATE TABLE child(id TEXT PRIMARY KEY,
+                                p TEXT NOT NULL REFERENCES parent(id));
+             INSERT INTO parent VALUES('p1');
+             INSERT INTO child VALUES('c1', 'p1');",
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        tx.execute("PRAGMA defer_foreign_keys = ON", []).unwrap();
+        // Delete parent BEFORE child — would normally violate FK immediately.
+        tx.execute("DELETE FROM parent WHERE id='p1'", []).unwrap();
+        tx.execute("DELETE FROM child WHERE id='c1'", []).unwrap();
+        tx.commit().unwrap();
+
+        let n: i32 = conn
+            .query_row("SELECT COUNT(*) FROM child", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 0);
     }
 

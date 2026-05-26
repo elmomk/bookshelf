@@ -63,6 +63,13 @@ spoiler-aware comments. Converted from the Life Manager codebase.
 - Error feedback: `ErrorBanner` with dismissible `error_msg` signal
 - Shelf swipe: right = advance my status (To Read → Reading → Finished), left = remove book
 
+## Change log invariants
+- Every write to `books`, `reading_progress`, `book_comments`, `comment_reactions`, `reader_aliases`, `notification_settings` MUST go through `crate::server::changelog::ChangeRecorder` inside a `transaction_with_behavior(Immediate)` — this is what powers Settings → Change log (undo + restore-to-before).
+- **Any new column added to a logged table must be NULLable or have a DEFAULT.** Old `db_changes` rows captured pre-column won't have the field; inverse-replay binds NULL for missing keys, which must satisfy the schema. Don't add NOT NULL without a default to a logged table.
+- The column lists in `src/server/changelog.rs::data_cols_of` are the source of truth for which columns the recorder captures. **If you add a column to a logged table, add it to that list too** — otherwise it's silently invisible to undo/restore.
+- `db_changes` is capped at 50,000 rows by `changelog::prune_oldest`, called from `db::init`. Snapshots remain the long-term archive; the change log is fine-grained undo on a healthy DB.
+- Notifications, notification_reads, push_subscriptions are intentionally NOT logged (ephemeral runtime state).
+
 ## Important Notes
 - **Never use `base_path`** in Dioxus.toml — breaks fullstack server function calls (Dioxus 0.7 bug)
 - PWA files (`sw.js`, `sw-register.js`, `manifest.json`, `icons/`, `fonts/`) are copied into `public/` via Dockerfile (Dioxus doesn't emit them)
