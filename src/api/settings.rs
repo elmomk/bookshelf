@@ -177,7 +177,9 @@ pub async fn create_snapshot() -> Result<SnapshotInfo, ServerFnError> {
     let conn = db::pool()
         .get()
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let id = snapshots::create(&conn).map_err(ServerFnError::new)?;
+    let id = snapshots::create_manual(&conn).map_err(ServerFnError::new)?;
+    // Manual cap (50) might just have been exceeded — best-effort sweep.
+    snapshots::prune();
     info_for(&id).ok_or_else(|| ServerFnError::new("Snapshot vanished after create"))
 }
 
@@ -228,7 +230,7 @@ pub async fn restore_full_from_snapshot(id: String) -> Result<(), ServerFnError>
         .get()
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     // Safety net: take a pre-restore snapshot so a botched rollback is undoable.
-    let _ = snapshots::create(&conn);
+    let _ = snapshots::create_safety(&conn);
 
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -286,7 +288,7 @@ pub async fn restore_book_from_snapshot(
         .get()
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     // Safety net.
-    let _ = snapshots::create(&conn);
+    let _ = snapshots::create_safety(&conn);
 
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -437,7 +439,7 @@ pub async fn undo_change(id: i64) -> Result<(), ServerFnError> {
         .get()
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     // Safety net: take a pre-undo snapshot.
-    let _ = snapshots::create(&conn);
+    let _ = snapshots::create_safety(&conn);
 
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -533,7 +535,7 @@ pub async fn restore_to_before_tx(tx_id: i64) -> Result<(), ServerFnError> {
     let mut conn = db::pool()
         .get()
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let _ = snapshots::create(&conn);
+    let _ = snapshots::create_safety(&conn);
 
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)

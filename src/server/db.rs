@@ -164,6 +164,10 @@ pub fn init() {
     // failure is non-fatal; the log just grows until the next init.
     crate::server::changelog::prune_oldest(&conn);
 
+    // Snapshot retention: GFS for daily auto, 30-day cutoff for safety,
+    // soft cap of 50 for manual. Fire-and-forget.
+    crate::server::snapshots::prune();
+
     POOL.set(pool).expect("DB pool already initialized");
 }
 

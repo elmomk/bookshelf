@@ -56,12 +56,14 @@ async fn run_daily_snapshots() {
 
         // Best-effort: never panic the task if the pool is briefly unhappy.
         match server::db::pool().get() {
-            Ok(conn) => match server::snapshots::create(&conn) {
+            Ok(conn) => match server::snapshots::create_auto(&conn) {
                 Ok(id) => eprintln!("auto-snapshot: {id}"),
                 Err(e) => eprintln!("auto-snapshot failed: {e}"),
             },
             Err(e) => eprintln!("auto-snapshot pool error: {e}"),
         }
+        // Run retention right after creating so we never miss a sweep.
+        server::snapshots::prune();
     }
 }
 

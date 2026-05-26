@@ -65,9 +65,14 @@ spoiler-aware comments. Converted from the Life Manager codebase.
 
 ## Snapshots
 - `src/server/snapshots.rs` manages files under `/app/data/snapshots/` (in the Docker volume) via SQLite's `VACUUM INTO` — atomic, online, WAL-safe.
-- **Daily auto-snapshot:** a tokio task spawned from `main.rs` takes one snapshot per 24h (catches up immediately on startup if the newest is older than 24h). Auto and manual snapshots share the `snap-<ms>.db` naming and appear together in Settings → History.
-- Manual snapshots come from Settings → History "📸 Take snapshot now" or are auto-created as a safety net before every restore (`restore_full_from_snapshot`, `restore_book_from_snapshot`, `undo_change`, `restore_to_before_tx`).
-- No automatic pruning — the user deletes snapshots from the UI. If the volume fills up, that's the manual lever.
+- **Three sources, distinguished by filename prefix** (the source drives retention):
+  - `manual-<ms>.db` — Settings → "📸 Take snapshot now". **Soft-cap 50** (oldest first).
+  - `safety-<ms>.db` — auto-taken before any restore (full/book/undo/restore-to-before). **30-day cutoff.**
+  - `auto-<ms>.db` — daily background task. **GFS retention**: all of last 7 days + 1 per ISO week for the previous 4 weeks + 1 per calendar month for the previous 12 months. ~23 files capped total.
+  - `snap-<ms>.db` — legacy (pre-v0.1.43). Treated as manual; never auto-pruned.
+- **Daily auto-snapshot:** a tokio task spawned from `main.rs` takes one `auto-` snapshot per 24h (catches up immediately on startup if the newest is older than 24h). Calls `snapshots::prune()` after each tick.
+- **Retention runs**: `snapshots::prune()` is called from `db::init` at startup, from the daily auto task after each snapshot, and from `create_snapshot` (manual) after success. Failures are silently swallowed; the next call retries.
+- All snapshot kinds appear together in Settings → History, newest first.
 
 ## Change log invariants
 - Every write to `books`, `reading_progress`, `book_comments`, `comment_reactions`, `reader_aliases`, `notification_settings` MUST go through `crate::server::changelog::ChangeRecorder` inside a `transaction_with_behavior(Immediate)` — this is what powers Settings → Change log (undo + restore-to-before).
