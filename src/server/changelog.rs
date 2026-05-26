@@ -7,9 +7,6 @@
 //! Constraint: a `ChangeRecorder` can only be built from a `&Transaction`, so
 //! the type system enforces that recorded writes are atomic.
 
-// Phase 0 ships the foundation only — the first caller arrives in Phase 1.
-#![allow(dead_code)]
-
 use rusqlite::OptionalExtension;
 use rusqlite::{params_from_iter, ToSql, Transaction};
 
@@ -137,6 +134,7 @@ impl<'tx> ChangeRecorder<'tx> {
 
     /// `tx_id` of this recorder — exposed so callers can refer back to it
     /// (e.g. to log a follow-up "restore_point" event under the same group).
+    #[allow(dead_code)]
     pub fn tx_id(&self) -> i64 {
         self.tx_id
     }
@@ -289,6 +287,106 @@ impl<'tx> ChangeRecorder<'tx> {
         )?;
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Inverse-apply (powers undo_change / restore_to_before_tx)
+// ---------------------------------------------------------------------------
+
+/// Convert a `serde_json::Value` into a SQLite-bindable `rusqlite::types::Value`.
+fn json_to_sqlite(v: &serde_json::Value) -> rusqlite::types::Value {
+    use rusqlite::types::Value;
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Integer(if *b { 1 } else { 0 }),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Real(f)
+            } else {
+                Value::Null
+            }
+        }
+        serde_json::Value::String(s) => Value::Text(s.clone()),
+        _ => Value::Text(v.to_string()),
+    }
+}
+
+/// Apply the inverse of one logged change against the given transaction.
+/// Caller should already hold an `IMMEDIATE` tx and have set
+/// `PRAGMA defer_foreign_keys = ON` if replaying many at once.
+pub fn apply_inverse(
+    tx: &Transaction,
+    op: &str,
+    tbl: &str,
+    pk_json: &str,
+    old_json: Option<&str>,
+) -> rusqlite::Result<()> {
+    let cols_data = data_cols_of(tbl);
+    let cols_pk = pk_cols_of(tbl);
+    if cols_data.is_empty() || cols_pk.is_empty() {
+        return Err(invalid("apply_inverse: unknown table"));
+    }
+    let pk_obj: serde_json::Value =
+        serde_json::from_str(pk_json).map_err(|_| invalid("apply_inverse: bad pk_json"))?;
+    let pk_vals: Vec<rusqlite::types::Value> = cols_pk
+        .iter()
+        .map(|c| json_to_sqlite(pk_obj.get(*c).unwrap_or(&serde_json::Value::Null)))
+        .collect();
+
+    match op {
+        "INSERT" => {
+            // Inverse of INSERT is DELETE by PK.
+            let where_sql = pk_where_sql(tbl);
+            let sql = format!("DELETE FROM {tbl} WHERE {where_sql}");
+            tx.execute(&sql, params_from_iter(pk_vals.iter()))?;
+        }
+        "UPDATE" => {
+            let old_str =
+                old_json.ok_or_else(|| invalid("apply_inverse UPDATE: missing old_json"))?;
+            let old_obj: serde_json::Value = serde_json::from_str(old_str)
+                .map_err(|_| invalid("apply_inverse: bad old_json"))?;
+            let set_sql = cols_data
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{c} = ?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let where_sql = cols_pk
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{c} = ?{}", cols_data.len() + i + 1))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let mut params: Vec<rusqlite::types::Value> = cols_data
+                .iter()
+                .map(|c| json_to_sqlite(old_obj.get(*c).unwrap_or(&serde_json::Value::Null)))
+                .collect();
+            params.extend(pk_vals);
+            let sql = format!("UPDATE {tbl} SET {set_sql} WHERE {where_sql}");
+            tx.execute(&sql, params_from_iter(params.iter()))?;
+        }
+        "DELETE" => {
+            let old_str =
+                old_json.ok_or_else(|| invalid("apply_inverse DELETE: missing old_json"))?;
+            let old_obj: serde_json::Value = serde_json::from_str(old_str)
+                .map_err(|_| invalid("apply_inverse: bad old_json"))?;
+            let cols_list = cols_data.join(", ");
+            let placeholders = (1..=cols_data.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let params: Vec<rusqlite::types::Value> = cols_data
+                .iter()
+                .map(|c| json_to_sqlite(old_obj.get(*c).unwrap_or(&serde_json::Value::Null)))
+                .collect();
+            let sql = format!("INSERT INTO {tbl} ({cols_list}) VALUES ({placeholders})");
+            tx.execute(&sql, params_from_iter(params.iter()))?;
+        }
+        _ => return Err(invalid("apply_inverse: unsupported op")),
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +640,153 @@ mod tests {
                 "expected {col}:null in {new}"
             );
         }
+    }
+
+    #[test]
+    fn inverse_round_trips_insert() {
+        let mut conn = setup();
+        let snapshot_before: Vec<(String, String)> = conn
+            .prepare("SELECT id, title FROM books")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO books(id, title, created_at) VALUES('inv1', 'X', 1.0)",
+            [],
+        )
+        .unwrap();
+        let rec = ChangeRecorder::begin(&tx, None, None).unwrap();
+        rec.record_insert("books", &[&"inv1"]).unwrap();
+        let (op, tbl, _, _) = last_change(&tx);
+        let pk: String = tx
+            .query_row(
+                "SELECT row_pk_json FROM db_changes ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply_inverse(&tx, &op, tbl.as_deref().unwrap(), &pk, None).unwrap();
+        tx.commit().unwrap();
+
+        let snapshot_after: Vec<(String, String)> = conn
+            .prepare("SELECT id, title FROM books")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(snapshot_before, snapshot_after);
+    }
+
+    #[test]
+    fn inverse_round_trips_update() {
+        let mut conn = setup();
+        conn.execute(
+            "INSERT INTO books(id, title, author, created_at)
+             VALUES('u1', 'Original', 'Alice', 1.0)",
+            [],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let rec = ChangeRecorder::begin(&tx, None, None).unwrap();
+        rec.record_update_with("books", &[&"u1"], |t| {
+            t.execute(
+                "UPDATE books SET title='New', author='Bob' WHERE id='u1'",
+                [],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+        let (op, tbl, old, _) = last_change(&tx);
+        let pk: String = tx
+            .query_row(
+                "SELECT row_pk_json FROM db_changes ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply_inverse(&tx, &op, tbl.as_deref().unwrap(), &pk, old.as_deref()).unwrap();
+        let (t, a): (String, Option<String>) = tx
+            .query_row(
+                "SELECT title, author FROM books WHERE id='u1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(t, "Original");
+        assert_eq!(a.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn inverse_round_trips_delete() {
+        let mut conn = setup();
+        conn.execute(
+            "INSERT INTO books(id, title, created_at) VALUES('d1', 'Gone', 1.0)",
+            [],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let rec = ChangeRecorder::begin(&tx, None, None).unwrap();
+        rec.record_delete("books", &[&"d1"]).unwrap();
+        let (op, tbl, old, _) = last_change(&tx);
+        let pk: String = tx
+            .query_row(
+                "SELECT row_pk_json FROM db_changes ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply_inverse(&tx, &op, tbl.as_deref().unwrap(), &pk, old.as_deref()).unwrap();
+        let title: String = tx
+            .query_row(
+                "SELECT title FROM books WHERE id='d1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(title, "Gone");
+    }
+
+    #[test]
+    fn inverse_handles_composite_pk_for_reactions() {
+        let mut conn = setup();
+
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO comment_reactions(comment_id, reader, emoji, created_at)
+             VALUES('c1', 'Mo', '👍', 1.0)",
+            [],
+        )
+        .unwrap();
+        let rec = ChangeRecorder::begin(&tx, None, None).unwrap();
+        rec.record_insert("comment_reactions", &[&"c1", &"Mo", &"👍"])
+            .unwrap();
+        let (op, tbl, _, _) = last_change(&tx);
+        let pk: String = tx
+            .query_row(
+                "SELECT row_pk_json FROM db_changes ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply_inverse(&tx, &op, tbl.as_deref().unwrap(), &pk, None).unwrap();
+        let n: i32 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM comment_reactions WHERE comment_id='c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

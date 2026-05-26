@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::models::{SnapshotBook, SnapshotInfo};
+use crate::models::{ChangeRow, SnapshotBook, SnapshotInfo};
 
 /// Returns `(current_display_name, auto_derived_default_name)`.
 /// When no alias is set the two are equal.
@@ -380,4 +380,205 @@ fn info_for(id: &str) -> Option<SnapshotInfo> {
 #[cfg(target_arch = "wasm32")]
 fn info_for(_id: &str) -> Option<SnapshotInfo> {
     None
+}
+
+// ============================================================================
+// Change log (per-write audit & undo)
+// ============================================================================
+
+/// Recent rows from `db_changes`, newest first. Capped at 200.
+#[server(headers: axum::http::HeaderMap)]
+pub async fn list_changes(limit: u32, offset: u32) -> Result<Vec<ChangeRow>, ServerFnError> {
+    use crate::server::{auth, db};
+    auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
+    let limit = limit.clamp(1, 200);
+    let conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, tx_id, ts, actor, label, op, tbl, row_pk_json, old_json, new_json
+             FROM db_changes ORDER BY id DESC LIMIT ?1 OFFSET ?2",
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![limit, offset], |r| {
+            Ok(ChangeRow {
+                id: r.get(0)?,
+                tx_id: r.get(1)?,
+                ts: r.get(2)?,
+                actor: r.get(3)?,
+                label: r.get(4)?,
+                op: r.get(5)?,
+                tbl: r.get(6)?,
+                row_pk_json: r.get(7)?,
+                old_json: r.get(8)?,
+                new_json: r.get(9)?,
+            })
+        })
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| ServerFnError::new(e.to_string()))?);
+    }
+    Ok(out)
+}
+
+/// Undo a single logged row change. Refuses if a newer change has touched the
+/// same row — that row's state has moved on and the right tool is
+/// `restore_to_before_tx`.
+#[server(headers: axum::http::HeaderMap)]
+pub async fn undo_change(id: i64) -> Result<(), ServerFnError> {
+    use crate::server::{auth, changelog, db, snapshots};
+    auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
+    let me = auth::display_name_from_headers(&headers);
+
+    let mut conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    // Safety net: take a pre-undo snapshot.
+    let _ = snapshots::create(&conn);
+
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    tx.execute("PRAGMA defer_foreign_keys = ON", [])
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let (op, tbl_opt, pk_opt, old_opt): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = tx
+        .query_row(
+            "SELECT op, tbl, row_pk_json, old_json FROM db_changes WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(|_| ServerFnError::new("Change not found"))?;
+
+    if !matches!(op.as_str(), "INSERT" | "UPDATE" | "DELETE") {
+        return Err(ServerFnError::new(
+            "This kind of change can't be undone directly. Use 'Restore to before this' instead.",
+        ));
+    }
+    let tbl = tbl_opt
+        .ok_or_else(|| ServerFnError::new("Change has no target table"))?;
+    let pk = pk_opt.ok_or_else(|| ServerFnError::new("Change has no primary key"))?;
+
+    let superseded: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM db_changes
+                           WHERE id > ?1 AND tbl = ?2 AND row_pk_json = ?3)",
+            rusqlite::params![id, tbl, pk],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if superseded {
+        return Err(ServerFnError::new(
+            "Superseded by a later edit; use 'Restore to before this' instead.",
+        ));
+    }
+
+    changelog::apply_inverse(&tx, &op, &tbl, &pk, old_opt.as_deref())
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    // Log the undo itself as a new high-level event.
+    let tx_id_new = changelog::next_tx_id(&tx)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let now = chrono::Utc::now().timestamp_millis() as f64;
+    let pk_ref = serde_json::json!({ "change_id": id }).to_string();
+    tx.execute(
+        "INSERT INTO db_changes
+            (tx_id, ts, actor, label, op, tbl, row_pk_json, old_json, new_json)
+         VALUES (?1, ?2, ?3, ?4, 'undo', NULL, ?5, NULL, NULL)",
+        rusqlite::params![tx_id_new, now, me, format!("undo_change({id})"), pk_ref],
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(())
+}
+
+/// Roll the DB back to the state immediately before the given transaction —
+/// applies inverses of every logged row change with `tx_id >= ?` in reverse
+/// id order, atomically and with deferred FK checks.
+#[server(headers: axum::http::HeaderMap)]
+pub async fn restore_to_before_tx(tx_id: i64) -> Result<(), ServerFnError> {
+    use crate::server::{auth, changelog, db, snapshots};
+    auth::user_from_headers(&headers).map_err(ServerFnError::new)?;
+    let me = auth::display_name_from_headers(&headers);
+
+    let mut conn = db::pool()
+        .get()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let _ = snapshots::create(&conn);
+
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    tx.execute("PRAGMA defer_foreign_keys = ON", [])
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    // Fetch all row-level changes in this tx and everything after, newest first.
+    let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT op, tbl, row_pk_json, old_json
+                 FROM db_changes WHERE tx_id >= ?1 ORDER BY id DESC",
+            )
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        let it = stmt
+            .query_map(rusqlite::params![tx_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        let mut v = Vec::new();
+        for r in it {
+            v.push(r.map_err(|e| ServerFnError::new(e.to_string()))?);
+        }
+        v
+    };
+
+    let mut applied = 0usize;
+    for (op, tbl_opt, pk_opt, old_opt) in rows {
+        // Skip metadata events (undo / restore_point / alias_rewrite /
+        // restore_full / restore_book) — they aren't directly invertible row
+        // changes; the underlying row changes around them have their own log
+        // entries.
+        if !matches!(op.as_str(), "INSERT" | "UPDATE" | "DELETE") {
+            continue;
+        }
+        let Some(tbl) = tbl_opt else { continue };
+        let Some(pk) = pk_opt else { continue };
+        changelog::apply_inverse(&tx, &op, &tbl, &pk, old_opt.as_deref())
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        applied += 1;
+    }
+
+    let tx_id_new = changelog::next_tx_id(&tx)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let now = chrono::Utc::now().timestamp_millis() as f64;
+    let pk_ref = serde_json::json!({ "tx_id_target": tx_id }).to_string();
+    let details = serde_json::json!({ "ops_reverted": applied }).to_string();
+    tx.execute(
+        "INSERT INTO db_changes
+            (tx_id, ts, actor, label, op, tbl, row_pk_json, old_json, new_json)
+         VALUES (?1, ?2, ?3, ?4, 'restore_point', NULL, ?5, ?6, NULL)",
+        rusqlite::params![
+            tx_id_new,
+            now,
+            me,
+            format!("restore_to_before_tx({tx_id}) — {applied} ops"),
+            pk_ref,
+            details,
+        ],
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    tx.commit()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(())
 }

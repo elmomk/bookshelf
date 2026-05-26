@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 
 /// One row from the `db_changes` audit log, surfaced to the client for the
 /// Settings → Change log UI.
-// Phase 0 ships the type; the first caller arrives in Phase 3.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChangeRow {
     /// Auto-increment id; also defines replay order (newest = highest).

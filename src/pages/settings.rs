@@ -4,7 +4,7 @@ use crate::api::settings as api;
 use crate::cache;
 use crate::components::error_banner::ErrorBanner;
 use crate::components::layout::SyncTrigger;
-use crate::models::{SnapshotBook, SnapshotInfo};
+use crate::models::{ChangeRow, SnapshotBook, SnapshotInfo};
 
 #[component]
 pub fn Settings() -> Element {
@@ -23,6 +23,15 @@ pub fn Settings() -> Element {
     // The snapshot id whose per-book picker is expanded, with its book list.
     let mut pick_for: Signal<Option<(String, Vec<SnapshotBook>)>> = use_signal(|| None);
 
+    // Change log state.
+    let mut changes = use_signal(Vec::<ChangeRow>::new);
+    let mut changes_offset = use_signal(|| 0_u32);
+    let mut changes_more = use_signal(|| true);
+    let mut changes_busy = use_signal(|| false);
+    // Change ids one tap away from firing their "Restore to before this".
+    let mut confirm_restore_tx: Signal<Option<i64>> = use_signal(|| None);
+    const CHANGES_PAGE: u32 = 30;
+
     let mut sync_trigger = use_context::<Signal<SyncTrigger>>();
 
     use_effect(move || {
@@ -40,8 +49,33 @@ pub fn Settings() -> Element {
             if let Ok(list) = api::list_snapshots().await {
                 snapshots.set(list);
             }
+            if let Ok(page) = api::list_changes(CHANGES_PAGE, 0).await {
+                changes_more.set(page.len() as u32 == CHANGES_PAGE);
+                changes_offset.set(page.len() as u32);
+                changes.set(page);
+            }
         });
     });
+
+    let load_more_changes = move |_| {
+        spawn(async move {
+            changes_busy.set(true);
+            let off = *changes_offset.read();
+            match api::list_changes(CHANGES_PAGE, off).await {
+                Ok(page) => {
+                    let got = page.len() as u32;
+                    let mut v = changes.read().clone();
+                    v.extend(page);
+                    changes.set(v);
+                    changes_offset.set(off + got);
+                    changes_more.set(got == CHANGES_PAGE);
+                }
+                Err(e) => error_msg.set(Some(format!("Failed to load changes: {e}"))),
+            }
+            changes_busy.set(false);
+        });
+    };
+
 
     let apply = move |value: String| {
         spawn(async move {
@@ -329,6 +363,142 @@ pub fn Settings() -> Element {
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            div { class: "bg-cyber-card/80 border border-cyber-border rounded-xl p-4 space-y-3",
+                p { class: "text-[10px] text-neon-pink tracking-[0.2em] uppercase font-bold", "Change log" }
+                p { class: "text-[9px] text-cyber-dim leading-relaxed",
+                    "Every change to books, comments, reactions, progress and your alias is captured here. Undo just one change if it's still the latest for its row, or roll back to before the whole transaction it belonged to. A safety snapshot is taken first so a wrong rollback is itself reversible."
+                }
+
+                if changes.read().is_empty() {
+                    p { class: "text-xs text-cyber-dim text-center py-2", "No changes recorded yet." }
+                }
+
+                for c in changes.read().clone().iter() {
+                    {
+                        let id = c.id;
+                        let tx_id = c.tx_id;
+                        let ts = c.ts;
+                        let actor = c.actor.clone().unwrap_or_default();
+                        let label = c.label.clone().unwrap_or_default();
+                        let op = c.op.clone();
+                        let tbl = c.tbl.clone().unwrap_or_default();
+                        let is_row_op = matches!(op.as_str(), "INSERT" | "UPDATE" | "DELETE");
+                        let is_confirm = *confirm_restore_tx.read() == Some(tx_id);
+                        let op_cls = match op.as_str() {
+                            "INSERT" => "text-neon-green",
+                            "UPDATE" => "text-neon-cyan",
+                            "DELETE" => "text-neon-magenta",
+                            _ => "text-neon-orange",
+                        };
+                        let op_label = if tbl.is_empty() {
+                            op.clone()
+                        } else {
+                            format!("{op} · {tbl}")
+                        };
+                        rsx! {
+                            div { class: "border border-cyber-border rounded-lg p-2 space-y-1",
+                                div { class: "flex items-baseline justify-between gap-2 text-[10px]",
+                                    span { class: "text-cyber-dim font-mono", {format_ts(ts)} }
+                                    if !actor.is_empty() {
+                                        span { class: "text-cyber-text", "{actor}" }
+                                    }
+                                    span { class: "ml-auto font-mono {op_cls}", "{op_label}" }
+                                }
+                                if !label.is_empty() {
+                                    p { class: "text-[11px] text-cyber-text break-words", "{label}" }
+                                }
+                                if is_row_op {
+                                    div { class: "flex flex-col gap-1 pt-1",
+                                        button {
+                                            r#type: "button",
+                                            class: "w-full bg-cyber-dark border border-cyber-border text-cyber-text rounded-md px-3 py-1.5 text-[10px] font-bold tracking-wider uppercase press-scale disabled:opacity-50",
+                                            disabled: *changes_busy.read(),
+                                            onclick: {
+                                                let mut sync_trigger = sync_trigger;
+                                                move |_| {
+                                                    spawn(async move {
+                                                        changes_busy.set(true);
+                                                        error_msg.set(None);
+                                                        match api::undo_change(id).await {
+                                                            Ok(()) => {
+                                                                if let Ok(page) = api::list_changes(CHANGES_PAGE, 0).await {
+                                                                    changes_more.set(page.len() as u32 == CHANGES_PAGE);
+                                                                    changes_offset.set(page.len() as u32);
+                                                                    changes.set(page);
+                                                                }
+                                                                if let Ok(ls) = api::list_snapshots().await {
+                                                                    snapshots.set(ls);
+                                                                }
+                                                                let cur = sync_trigger.read().0;
+                                                                sync_trigger.set(SyncTrigger(cur + 1));
+                                                            }
+                                                            Err(e) => error_msg.set(Some(format!("Undo failed: {e}"))),
+                                                        }
+                                                        changes_busy.set(false);
+                                                    });
+                                                }
+                                            },
+                                            "↶ Undo this change"
+                                        }
+                                        button {
+                                            r#type: "button",
+                                            class: if is_confirm {
+                                                "w-full bg-neon-magenta/20 border border-neon-magenta text-neon-magenta rounded-md px-3 py-1.5 text-[10px] font-bold tracking-wider uppercase press-scale"
+                                            } else {
+                                                "w-full bg-cyber-dark border border-cyber-border text-cyber-dim rounded-md px-3 py-1.5 text-[10px] font-bold tracking-wider uppercase press-scale disabled:opacity-50"
+                                            },
+                                            disabled: *changes_busy.read(),
+                                            onclick: {
+                                                let mut sync_trigger = sync_trigger;
+                                                move |_| {
+                                                    let am_confirming = *confirm_restore_tx.read() == Some(tx_id);
+                                                    if !am_confirming {
+                                                        confirm_restore_tx.set(Some(tx_id));
+                                                        return;
+                                                    }
+                                                    confirm_restore_tx.set(None);
+                                                    spawn(async move {
+                                                        changes_busy.set(true);
+                                                        error_msg.set(None);
+                                                        match api::restore_to_before_tx(tx_id).await {
+                                                            Ok(()) => {
+                                                                if let Ok(page) = api::list_changes(CHANGES_PAGE, 0).await {
+                                                                    changes_more.set(page.len() as u32 == CHANGES_PAGE);
+                                                                    changes_offset.set(page.len() as u32);
+                                                                    changes.set(page);
+                                                                }
+                                                                if let Ok(ls) = api::list_snapshots().await {
+                                                                    snapshots.set(ls);
+                                                                }
+                                                                let cur = sync_trigger.read().0;
+                                                                sync_trigger.set(SyncTrigger(cur + 1));
+                                                            }
+                                                            Err(e) => error_msg.set(Some(format!("Restore failed: {e}"))),
+                                                        }
+                                                        changes_busy.set(false);
+                                                    });
+                                                }
+                                            },
+                                            { if is_confirm { "Tap again to roll back to before this" } else { "↺ Restore to before this" } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if *changes_more.read() {
+                    button {
+                        r#type: "button",
+                        class: "w-full bg-cyber-dark border border-cyber-border text-cyber-dim rounded-md px-3 py-2 text-[10px] font-bold tracking-wider uppercase press-scale disabled:opacity-50",
+                        disabled: *changes_busy.read(),
+                        onclick: load_more_changes,
+                        { if *changes_busy.read() { "LOADING…" } else { "Load more" } }
                     }
                 }
             }
