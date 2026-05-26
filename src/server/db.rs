@@ -103,7 +103,30 @@ pub fn init() {
             created_at REAL NOT NULL,
             PRIMARY KEY (comment_id, reader, emoji)
         );
-        CREATE INDEX IF NOT EXISTS idx_reactions_comment ON comment_reactions(comment_id);",
+        CREATE INDEX IF NOT EXISTS idx_reactions_comment ON comment_reactions(comment_id);
+        -- Per-write audit log. Powers Settings → Change log. Any future column
+        -- added to a *logged* table (books, reading_progress, book_comments,
+        -- comment_reactions, reader_aliases, notification_settings) MUST be
+        -- NULLable or have a DEFAULT, so inverse-replay never violates NOT NULL.
+        CREATE TABLE IF NOT EXISTS db_changes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            tx_id       INTEGER NOT NULL,
+            ts          REAL NOT NULL,
+            actor       TEXT,
+            label       TEXT,
+            op          TEXT NOT NULL,
+            tbl         TEXT,
+            row_pk_json TEXT,
+            old_json    TEXT,
+            new_json    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_db_changes_tx ON db_changes(tx_id);
+        CREATE INDEX IF NOT EXISTS idx_db_changes_ts ON db_changes(ts);
+        CREATE TABLE IF NOT EXISTS change_tx_seq (
+            only_row INTEGER PRIMARY KEY CHECK (only_row = 1),
+            v        INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO change_tx_seq(only_row, v) VALUES (1, 0);",
     )
     .expect("Failed to run migrations");
 
