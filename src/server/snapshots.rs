@@ -264,15 +264,13 @@ pub fn prune() {
 
 fn prune_safety() {
     let now = chrono::Utc::now().timestamp_millis() as f64;
-    let cutoff = now - SAFETY_MAX_AGE_DAYS * DAY_MS;
-    for id in list_ids() {
-        if source_of(&id) == Source::Safety {
-            if let Some(ts) = ts_of(&id) {
-                if ts < cutoff {
-                    let _ = delete(&id);
-                }
-            }
-        }
+    let safeties: Vec<(String, f64)> = list_ids()
+        .into_iter()
+        .filter(|id| source_of(id) == Source::Safety)
+        .filter_map(|id| ts_of(&id).map(|ts| (id, ts)))
+        .collect();
+    for id in safety_drop_ids(now, &safeties) {
+        let _ = delete(&id);
     }
 }
 
@@ -282,12 +280,8 @@ fn prune_manual() {
         .filter(|id| source_of(id) == Source::Manual)
         .filter_map(|id| ts_of(&id).map(|ts| (id, ts)))
         .collect();
-    if manuals.len() <= MANUAL_SOFT_CAP {
-        return;
-    }
-    // Newest first; drop the tail.
     manuals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    for (id, _) in manuals.into_iter().skip(MANUAL_SOFT_CAP) {
+    for id in manual_drop_ids(&manuals, MANUAL_SOFT_CAP) {
         let _ = delete(&id);
     }
 }
@@ -302,22 +296,61 @@ fn prune_auto_gfs() {
     if autos.is_empty() {
         return;
     }
-    // Newest first.
     autos.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let keep = gfs_keep_ids(now, &autos);
+    for (id, _) in &autos {
+        if !keep.contains(id) {
+            let _ = delete(id);
+        }
+    }
+}
 
-    let daily_cutoff = now - AUTO_DAILY_DAYS * DAY_MS;
-    let weekly_cutoff = now - AUTO_WEEKLY_DAYS * DAY_MS;
-    let monthly_cutoff = now - AUTO_MONTHLY_DAYS * DAY_MS;
+// --- Pure helpers — testable, no filesystem ---------------------------------
+
+/// IDs older than the 30-day cutoff.
+fn safety_drop_ids(now_ms: f64, safeties: &[(String, f64)]) -> Vec<String> {
+    let cutoff = now_ms - SAFETY_MAX_AGE_DAYS * DAY_MS;
+    safeties
+        .iter()
+        .filter(|(_, ts)| *ts < cutoff)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// IDs to drop given a list already sorted **newest first** and a soft cap.
+fn manual_drop_ids(manuals_sorted: &[(String, f64)], soft_cap: usize) -> Vec<String> {
+    if manuals_sorted.len() <= soft_cap {
+        return vec![];
+    }
+    manuals_sorted
+        .iter()
+        .skip(soft_cap)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Compute the GFS-kept set from a list of `(id, ts_ms)` **sorted newest
+/// first**. Keep all of last `AUTO_DAILY_DAYS` + 1 per ISO-ish week for the
+/// next `AUTO_WEEKLY_DAYS-AUTO_DAILY_DAYS` window + 1 per calendar month for
+/// the next `AUTO_MONTHLY_DAYS-AUTO_WEEKLY_DAYS` window. Older → drop.
+fn gfs_keep_ids(
+    now_ms: f64,
+    autos_sorted: &[(String, f64)],
+) -> std::collections::HashSet<String> {
+    let daily_cutoff = now_ms - AUTO_DAILY_DAYS * DAY_MS;
+    let weekly_cutoff = now_ms - AUTO_WEEKLY_DAYS * DAY_MS;
+    let monthly_cutoff = now_ms - AUTO_MONTHLY_DAYS * DAY_MS;
 
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_weeks: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut seen_months: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
-    for (id, ts) in &autos {
+    for (id, ts) in autos_sorted {
         if *ts >= daily_cutoff {
             keep.insert(id.clone());
         } else if *ts >= weekly_cutoff {
-            // Bucket by ISO week: convert ms → days → integer-divide by 7.
+            // Week bucket: ms → whole days → integer-divide by 7. Iteration
+            // is newest-first, so the first hit per bucket is the newest.
             let week = ((*ts / DAY_MS) / 7.0).floor() as i64;
             if seen_weeks.insert(week) {
                 keep.insert(id.clone());
@@ -333,12 +366,143 @@ fn prune_auto_gfs() {
                 keep.insert(id.clone());
             }
         }
-        // else: older than monthly_cutoff → drop
+    }
+    keep
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the pure retention helpers
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(now_ms: f64, age_days: f64) -> f64 {
+        now_ms - age_days * DAY_MS
+    }
+    fn id(age_days: f64) -> String {
+        format!("auto-{}.db", (age_days * 1000.0) as i64) // unique per age
+    }
+    fn pair(now_ms: f64, age_days: f64) -> (String, f64) {
+        (id(age_days), ts(now_ms, age_days))
+    }
+    /// Build a list of `n_days` auto-snapshots (one at each integer day age 0..n_days-1),
+    /// newest first.
+    fn daily_set(now_ms: f64, n_days: usize) -> Vec<(String, f64)> {
+        (0..n_days).map(|d| pair(now_ms, d as f64)).collect()
     }
 
-    for (id, _) in &autos {
-        if !keep.contains(id) {
-            let _ = delete(id);
+    // ---- safety ----
+
+    #[test]
+    fn safety_drops_only_older_than_30_days() {
+        // Use a real-ish "now" so chrono's month bucketing wouldn't trip up
+        // an absolute-time-based test (irrelevant here but consistent).
+        let now = 1_780_000_000_000.0;
+        let items = vec![
+            pair(now, 1.0),
+            pair(now, 10.0),
+            pair(now, 20.0),
+            pair(now, 29.0),
+            pair(now, 31.0),
+            pair(now, 60.0),
+        ];
+        let dropped = safety_drop_ids(now, &items);
+        assert_eq!(dropped.len(), 2);
+        assert!(dropped.contains(&id(31.0)));
+        assert!(dropped.contains(&id(60.0)));
+    }
+
+    #[test]
+    fn safety_keeps_all_when_all_fresh() {
+        let now = 1_780_000_000_000.0;
+        let items: Vec<_> = (0..5).map(|d| pair(now, d as f64)).collect();
+        assert!(safety_drop_ids(now, &items).is_empty());
+    }
+
+    // ---- manual ----
+
+    #[test]
+    fn manual_cap_keeps_first_n() {
+        let now = 1_780_000_000_000.0;
+        let items: Vec<_> = (0..60).map(|d| pair(now, d as f64)).collect(); // sorted newest first
+        let dropped = manual_drop_ids(&items, 50);
+        assert_eq!(dropped.len(), 10);
+        // The 10 dropped should be the oldest (highest age = end of the list).
+        for d in 50..60 {
+            assert!(dropped.contains(&id(d as f64)));
         }
+    }
+
+    #[test]
+    fn manual_under_cap_drops_nothing() {
+        let now = 1_780_000_000_000.0;
+        let items: Vec<_> = (0..20).map(|d| pair(now, d as f64)).collect();
+        assert!(manual_drop_ids(&items, 50).is_empty());
+    }
+
+    // ---- gfs ----
+
+    #[test]
+    fn gfs_keeps_all_within_daily_window() {
+        let now = 1_780_000_000_000.0;
+        let items = daily_set(now, 7);
+        let keep = gfs_keep_ids(now, &items);
+        assert_eq!(keep.len(), 7);
+        for (id, _) in &items {
+            assert!(keep.contains(id), "expected {id} kept");
+        }
+    }
+
+    #[test]
+    fn gfs_drops_beyond_400_days() {
+        let now = 1_780_000_000_000.0;
+        let items = vec![pair(now, 0.0), pair(now, 500.0), pair(now, 1000.0)];
+        let keep = gfs_keep_ids(now, &items);
+        assert!(keep.contains(&id(0.0)));
+        assert!(!keep.contains(&id(500.0)));
+        assert!(!keep.contains(&id(1000.0)));
+    }
+
+    #[test]
+    fn gfs_long_horizon_caps_at_about_23() {
+        // 365 daily snapshots → ~7 daily + ~4 weekly + ~12 monthly. Bucket
+        // alignment can shift the count by a couple in either direction.
+        let now = 1_780_000_000_000.0;
+        let items = daily_set(now, 365);
+        let keep = gfs_keep_ids(now, &items);
+        assert!(
+            (20..=27).contains(&keep.len()),
+            "expected ~23 kept, got {} from 365 days",
+            keep.len()
+        );
+
+        // Sanity: every one of the last 7 days is kept (daily window).
+        for d in 0..7 {
+            assert!(
+                keep.contains(&id(d as f64)),
+                "missing daily {d}d ago in keep set"
+            );
+        }
+    }
+
+    #[test]
+    fn gfs_weekly_window_dedupes_per_week_picking_newest() {
+        let now = 1_780_000_000_000.0;
+        // Three snapshots all inside the same calendar week, ages 10/11/12d
+        // (outside daily window of 7d, inside weekly window of 35d).
+        let items = vec![pair(now, 10.0), pair(now, 11.0), pair(now, 12.0)];
+        let keep = gfs_keep_ids(now, &items);
+        // Same week-bucket → only one kept; iteration is newest-first so the
+        // 10-day-old wins.
+        assert_eq!(keep.len(), 1);
+        assert!(keep.contains(&id(10.0)));
+    }
+
+    #[test]
+    fn gfs_empty_input_returns_empty_set() {
+        let now = 1_780_000_000_000.0;
+        assert!(gfs_keep_ids(now, &[]).is_empty());
     }
 }

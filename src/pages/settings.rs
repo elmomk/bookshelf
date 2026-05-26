@@ -210,13 +210,15 @@ pub fn Settings() -> Element {
                         let label_id = id.clone();
                         let ts_label = format_ts(info.created_at);
                         let size_label = format_size(info.size_bytes);
+                        let (source_label, source_cls) = snapshot_source(&id);
                         let is_confirm = confirm_id_now.as_deref() == Some(id.as_str());
                         let pick_open = pick_now.as_ref().map(|(i, _)| i.as_str()) == Some(id.as_str());
                         rsx! {
                             div { class: "border border-cyber-border rounded-lg p-3 space-y-2",
-                                div { class: "flex items-baseline justify-between gap-2",
+                                div { class: "flex items-baseline gap-2",
+                                    span { class: "text-[9px] font-bold tracking-wider uppercase border rounded px-1 leading-none py-0.5 {source_cls}", "{source_label}" }
                                     span { class: "text-xs text-neon-cyan font-mono", "{ts_label}" }
-                                    span { class: "text-[9px] text-cyber-dim font-mono", "{size_label}" }
+                                    span { class: "ml-auto text-[9px] text-cyber-dim font-mono", "{size_label}" }
                                 }
                                 div { class: "flex flex-wrap gap-2 text-[10px] text-cyber-dim",
                                     span { "📚 {info.books} books" }
@@ -511,6 +513,20 @@ fn format_ts(ms: f64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
         .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "—".to_string())
+}
+
+/// Source badge from a snapshot id — mirrors `server::snapshots::source_of`
+/// without needing the wasm bundle to depend on the server module. Returns
+/// `(label, tailwind_classes)`.
+fn snapshot_source(id: &str) -> (&'static str, &'static str) {
+    if id.starts_with("auto-") {
+        ("AUTO", "text-neon-purple border-neon-purple/40 bg-neon-purple/15")
+    } else if id.starts_with("safety-") {
+        ("SAFETY", "text-neon-orange border-neon-orange/40 bg-neon-orange/15")
+    } else {
+        // `manual-` and the legacy `snap-` both render as MANUAL.
+        ("MANUAL", "text-neon-cyan border-neon-cyan/40 bg-neon-cyan/15")
+    }
 }
 
 /// Human-friendly file size.
