@@ -445,18 +445,37 @@ pub async fn undo_change(id: i64) -> Result<(), ServerFnError> {
     tx.execute("PRAGMA defer_foreign_keys = ON", [])
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let (op, tbl_opt, pk_opt, old_opt): (
+    let (op, tbl_opt, pk_opt, old_opt, target_tx_id): (
         String,
         Option<String>,
         Option<String>,
         Option<String>,
+        i64,
     ) = tx
         .query_row(
-            "SELECT op, tbl, row_pk_json, old_json FROM db_changes WHERE id = ?1",
+            "SELECT op, tbl, row_pk_json, old_json, tx_id FROM db_changes WHERE id = ?1",
             rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .map_err(|_| ServerFnError::new("Change not found"))?;
+
+    // If this change is part of a multi-table alias rewrite, single-row undo
+    // would leave the cascaded renames in place — direct the user at the
+    // whole-transaction restore instead.
+    let part_of_alias_rewrite: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM db_changes
+                           WHERE tx_id = ?1 AND op = 'alias_rewrite')",
+            rusqlite::params![target_tx_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if part_of_alias_rewrite {
+        return Err(ServerFnError::new(
+            "This change is part of a multi-table alias rewrite. \
+             Use 'Restore to before this' to revert the full rename.",
+        ));
+    }
 
     if !matches!(op.as_str(), "INSERT" | "UPDATE" | "DELETE") {
         return Err(ServerFnError::new(
@@ -544,18 +563,28 @@ pub async fn restore_to_before_tx(tx_id: i64) -> Result<(), ServerFnError> {
 
     let mut applied = 0usize;
     for (op, tbl_opt, pk_opt, old_opt) in rows {
-        // Skip metadata events (undo / restore_point / alias_rewrite /
-        // restore_full / restore_book) — they aren't directly invertible row
-        // changes; the underlying row changes around them have their own log
-        // entries.
-        if !matches!(op.as_str(), "INSERT" | "UPDATE" | "DELETE") {
-            continue;
+        match op.as_str() {
+            "INSERT" | "UPDATE" | "DELETE" => {
+                let Some(tbl) = tbl_opt else { continue };
+                let Some(pk) = pk_opt else { continue };
+                changelog::apply_inverse(&tx, &op, &tbl, &pk, old_opt.as_deref())
+                    .map_err(|e| ServerFnError::new(e.to_string()))?;
+                applied += 1;
+            }
+            "alias_rewrite" => {
+                // The bulk renames live only in this event's details_json
+                // (`old_json` slot); replay them in reverse via the helper.
+                if let Some(details) = old_opt.as_deref() {
+                    changelog::apply_alias_rewrite_inverse(&tx, details)
+                        .map_err(|e| ServerFnError::new(e.to_string()))?;
+                    applied += 1;
+                }
+            }
+            // Other metadata events (undo, restore_point, restore_full,
+            // restore_book) are audit-only — their underlying row changes
+            // (if any) are logged separately.
+            _ => {}
         }
-        let Some(tbl) = tbl_opt else { continue };
-        let Some(pk) = pk_opt else { continue };
-        changelog::apply_inverse(&tx, &op, &tbl, &pk, old_opt.as_deref())
-            .map_err(|e| ServerFnError::new(e.to_string()))?;
-        applied += 1;
     }
 
     let tx_id_new = changelog::next_tx_id(&tx)

@@ -80,6 +80,11 @@ pub fn ts_of(id: &str) -> Option<f64> {
         .ok()
 }
 
+/// Unix-millis timestamp of the newest snapshot, or `None` if there are none.
+pub fn ts_of_newest() -> Option<f64> {
+    list_ids().into_iter().filter_map(|id| ts_of(&id)).next()
+}
+
 /// File size in bytes (0 if unreadable).
 pub fn size_of(id: &str) -> u64 {
     path_for(id)

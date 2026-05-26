@@ -328,6 +328,35 @@ fn json_to_sqlite(v: &serde_json::Value) -> rusqlite::types::Value {
     }
 }
 
+/// Inverse of an `alias_rewrite` event: rename every cascading rename back
+/// from `new` to `old`. Mirrors the bulk UPDATEs in `set_alias`.
+pub fn apply_alias_rewrite_inverse(
+    tx: &Transaction,
+    details_json: &str,
+) -> rusqlite::Result<()> {
+    let v: serde_json::Value = serde_json::from_str(details_json)
+        .map_err(|_| invalid("apply_alias_rewrite_inverse: bad details_json"))?;
+    let old = v
+        .get("old")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| invalid("apply_alias_rewrite_inverse: missing `old`"))?;
+    let new = v
+        .get("new")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| invalid("apply_alias_rewrite_inverse: missing `new`"))?;
+    for sql in [
+        "UPDATE OR IGNORE reading_progress SET reader = ?1 WHERE reader = ?2",
+        "UPDATE book_comments SET author = ?1 WHERE author = ?2",
+        "UPDATE notifications SET actor = ?1 WHERE actor = ?2",
+        "UPDATE OR IGNORE notification_reads SET user_name = ?1 WHERE user_name = ?2",
+        "UPDATE OR IGNORE notification_settings SET user_name = ?1 WHERE user_name = ?2",
+        "UPDATE push_subscriptions SET user_name = ?1 WHERE user_name = ?2",
+    ] {
+        tx.execute(sql, rusqlite::params![old, new])?;
+    }
+    Ok(())
+}
+
 /// Apply the inverse of one logged change against the given transaction.
 /// Caller should already hold an `IMMEDIATE` tx and have set
 /// `PRAGMA defer_foreign_keys = ON` if replaying many at once.

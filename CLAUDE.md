@@ -63,6 +63,12 @@ spoiler-aware comments. Converted from the Life Manager codebase.
 - Error feedback: `ErrorBanner` with dismissible `error_msg` signal
 - Shelf swipe: right = advance my status (To Read → Reading → Finished), left = remove book
 
+## Snapshots
+- `src/server/snapshots.rs` manages files under `/app/data/snapshots/` (in the Docker volume) via SQLite's `VACUUM INTO` — atomic, online, WAL-safe.
+- **Daily auto-snapshot:** a tokio task spawned from `main.rs` takes one snapshot per 24h (catches up immediately on startup if the newest is older than 24h). Auto and manual snapshots share the `snap-<ms>.db` naming and appear together in Settings → History.
+- Manual snapshots come from Settings → History "📸 Take snapshot now" or are auto-created as a safety net before every restore (`restore_full_from_snapshot`, `restore_book_from_snapshot`, `undo_change`, `restore_to_before_tx`).
+- No automatic pruning — the user deletes snapshots from the UI. If the volume fills up, that's the manual lever.
+
 ## Change log invariants
 - Every write to `books`, `reading_progress`, `book_comments`, `comment_reactions`, `reader_aliases`, `notification_settings` MUST go through `crate::server::changelog::ChangeRecorder` inside a `transaction_with_behavior(Immediate)` — this is what powers Settings → Change log (undo + restore-to-before).
 - **Any new column added to a logged table must be NULLable or have a DEFAULT.** Old `db_changes` rows captured pre-column won't have the field; inverse-replay binds NULL for missing keys, which must satisfy the schema. Don't add NOT NULL without a default to a logged table.
