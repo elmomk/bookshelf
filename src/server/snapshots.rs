@@ -99,21 +99,28 @@ pub fn create_auto(conn: &Connection) -> Result<String, String> {
 }
 
 /// Snapshot filename ids sorted newest first (across all sources).
+///
+/// **Sort by parsed timestamp, not by filename.** String-ordering "snap-…"
+/// alongside "auto-…" puts every legacy `snap-` snapshot above newer `auto-`
+/// snapshots — once seen as a runaway daily-snapshot loop where
+/// `ts_of_newest()` kept returning an old `snap-` ts, making elapsed always
+/// exceed a day and skipping the sleep entirely.
 pub fn list_ids() -> Vec<String> {
-    let mut out = vec![];
+    let mut out: Vec<(String, f64)> = vec![];
     if let Ok(rd) = fs::read_dir(snapshots_dir()) {
         for entry in rd.flatten() {
             if let Some(name) = entry.file_name().to_str() {
                 if ALL_PREFIXES.iter().any(|p| name.starts_with(p))
                     && name.ends_with(SUFFIX)
                 {
-                    out.push(name.to_string());
+                    let ts = ts_of(name).unwrap_or(0.0);
+                    out.push((name.to_string(), ts));
                 }
             }
         }
     }
-    out.sort_by(|a, b| b.cmp(a));
-    out
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out.into_iter().map(|(id, _)| id).collect()
 }
 
 /// Parse the unix-millis timestamp embedded in the snapshot id.

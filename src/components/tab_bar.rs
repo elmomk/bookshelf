@@ -9,6 +9,7 @@ pub fn TabBar() -> Element {
 
     let tabs: Vec<(Route, &str, Element)> = vec![
         (Route::Books {}, "Shelf", rsx! { BookIcon { class: "w-5 h-5".to_string() } }),
+        (Route::Leaderboard {}, "Compete", rsx! { TrophyIcon { class: "w-5 h-5".to_string() } }),
         (Route::Activity {}, "Activity", rsx! { ActivityIcon { class: "w-5 h-5".to_string() } }),
     ];
 

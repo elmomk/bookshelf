@@ -21,6 +21,7 @@ pub fn AppLayout() -> Element {
     let title = match route {
         Route::Books {} => "THE SHELF",
         Route::BookDetail { .. } => "BOOK",
+        Route::Leaderboard {} => "COMPETE",
         Route::Activity {} => "CLUB ACTIVITY",
         Route::Settings {} => "SETTINGS",
         _ => "BOOKCLUB",

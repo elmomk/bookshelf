@@ -41,18 +41,31 @@ fn main() {
 async fn run_daily_snapshots() {
     use std::time::Duration;
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    // Defense-in-depth: never create auto snapshots more often than this,
+    // no matter what the math says. If a regression ever makes the sleep
+    // calculation return 0, this caps damage at ~24 snapshots/day instead
+    // of saturating the disk.
+    const MIN_INTERVAL_MS: u64 = 60 * 60 * 1000; // 1 hour
+
+    // Sanity log — confirms exactly one task instance is running.
+    eprintln!("daily-snapshots: task started");
 
     loop {
         // Sleep until the next due tick (immediate if none in last 24h).
         let now_ms = chrono::Utc::now().timestamp_millis() as i64;
-        let due_in_ms: i64 = match server::snapshots::ts_of_newest() {
-            Some(ts) => (DAY_MS as i64) - (now_ms - ts as i64),
-            None => 0,
+        let newest = server::snapshots::ts_of_newest();
+        let due_in_ms: u64 = match newest {
+            Some(ts) => {
+                let elapsed_ms = (now_ms - ts as i64).max(0) as u64;
+                DAY_MS.saturating_sub(elapsed_ms).max(MIN_INTERVAL_MS)
+            }
+            None => MIN_INTERVAL_MS,
         };
-        let due_in_ms = due_in_ms.clamp(0, DAY_MS as i64) as u64;
-        if due_in_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(due_in_ms)).await;
-        }
+        eprintln!(
+            "daily-snapshots: sleeping due_in_ms={} (newest_ts={:?}, now_ms={})",
+            due_in_ms, newest, now_ms
+        );
+        tokio::time::sleep(Duration::from_millis(due_in_ms)).await;
 
         // Best-effort: never panic the task if the pool is briefly unhappy.
         match server::db::pool().get() {

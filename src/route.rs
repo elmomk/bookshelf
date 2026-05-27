@@ -11,6 +11,8 @@ pub enum Route {
         Books {},
         #[route("/book/:id")]
         BookDetail { id: String },
+        #[route("/leaderboard")]
+        Leaderboard {},
         #[route("/activity")]
         Activity {},
         #[route("/settings")]
