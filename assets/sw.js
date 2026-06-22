@@ -2,6 +2,11 @@
 // deploy (auto cache-bust). 'bookclub-dev' is the value used by `dx serve`.
 const CACHE_NAME = 'bookclub-dev';
 
+// Book covers come from cross-origin hosts (Google Books / Open Library) and
+// are content-immutable. They live in their own cache that is NOT version-
+// busted on deploy, so the shelf keeps showing covers offline across releases.
+const COVER_CACHE = 'bookclub-covers';
+
 const PRECACHE_URLS = [
   '/',
   '/manifest.json',
@@ -35,7 +40,9 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys().then((names) =>
       Promise.all(
-        names.filter((n) => n !== CACHE_NAME).map((n) => caches.delete(n))
+        names
+          .filter((n) => n !== CACHE_NAME && n !== COVER_CACHE)
+          .map((n) => caches.delete(n))
       )
     )
   );
@@ -51,6 +58,28 @@ self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
 
   const url = new URL(event.request.url);
+
+  // Book covers (cross-origin images from Google Books / Open Library):
+  // cache-first into the persistent cover cache so the shelf and book pages
+  // render covers offline. These are no-cors `opaque` responses (status 0),
+  // so we can't inspect them — cache any fetch that doesn't throw.
+  if (event.request.destination === 'image' && url.origin !== self.location.origin) {
+    event.respondWith((async () => {
+      const cache = await caches.open(COVER_CACHE);
+      const cached = await cache.match(event.request);
+      if (cached) return cached;
+      try {
+        const response = await fetch(event.request);
+        if (response && (response.ok || response.type === 'opaque')) {
+          cache.put(event.request, response.clone());
+        }
+        return response;
+      } catch {
+        return cached || Response.error();
+      }
+    })());
+    return;
+  }
 
   // Skip server function calls and any non-same-origin requests
   if (url.origin !== self.location.origin) return;

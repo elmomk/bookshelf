@@ -73,6 +73,19 @@ input.oncancel = () => dioxus.send('[]');
 input.click();
 "#;
 
+/// Best-effort offline read of a single book. Prefers the per-book cache
+/// (`book_<id>`, written on every detail-page visit), then falls back to the
+/// shelf list cache (`books`) — since `get_book` is just `list_books().find(id)`
+/// server-side, a book the reader has only ever seen on the shelf still opens
+/// fully offline.
+fn cached_book(book_id: &str) -> Option<Book> {
+    cache::read::<Book>(&format!("book_{book_id}")).or_else(|| {
+        cache::read::<Vec<Book>>("books")?
+            .into_iter()
+            .find(|b| b.id == book_id)
+    })
+}
+
 /// Mirror a (possibly cached) book's own-progress fields into the editor
 /// signals. Signals are `Copy`, so this takes them by value like `toc_selector`.
 fn apply_progress(
@@ -155,7 +168,7 @@ pub fn BookDetail(id: String) -> Element {
                         // Offline / server unreachable: fall back to last-known
                         // copy so the page isn't blank.
                         if book.read().is_none() {
-                            if let Some(b) = cache::read::<Book>(&book_key) {
+                            if let Some(b) = cached_book(&book_id) {
                                 apply_progress(&b, edit_page, edit_chapter, edit_status);
                                 book.set(Some(b));
                             }
@@ -217,7 +230,7 @@ pub fn BookDetail(id: String) -> Element {
             // keeps this if the network is down). NOTE: do not read `book`
             // reactively here — reload() writes it, which would re-fire this
             // effect in a tight loop (sync flicker + clobbered ToC edits).
-            if let Some(b) = cache::read::<Book>(&format!("book_{book_id}")) {
+            if let Some(b) = cached_book(&book_id) {
                 apply_progress(&b, edit_page, edit_chapter, edit_status);
                 book.set(Some(b));
             }

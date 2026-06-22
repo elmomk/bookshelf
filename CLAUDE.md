@@ -63,6 +63,13 @@ spoiler-aware comments. Converted from the Life Manager codebase.
 - Error feedback: `ErrorBanner` with dismissible `error_msg` signal
 - Shelf swipe: right = advance my status (To Read → Reading → Finished), left = remove book
 
+## Offline / PWA caching
+Everything needed to read the shelf is available offline after one online visit:
+- **App shell** (WASM/JS via `-dxh` hashed names, CSS, fonts, icons, `/` index) — cached by `assets/sw.js`. Hashed assets are cache-first (immutable); the rest is stale-while-revalidate. Cache name is version-busted on every deploy (`scripts/deploy.sh` rewrites `CACHE_NAME`).
+- **Data** (shelf list, per-book detail, comments, `me`, expanded threads) — cached in `localStorage` via `src/cache.rs` (`bc_*` keys). Pages paint from cache instantly, then `reload()` refreshes; on network failure they keep the cached copy and set `SyncStatus::CachedOnly`.
+- **Book covers** (cross-origin from Google Books / Open Library) — cached cache-first in a **separate `bookclub-covers` cache** that is intentionally NOT version-busted, so covers survive deploys. They come back as `opaque` (no-cors) responses, so the SW caches any fetch that doesn't throw.
+- **Open any shelf book offline:** `book_detail.rs::cached_book` falls back from the per-book cache to the shelf-list cache (`get_book` is just `list_books().find(id)` server-side), so a book the reader only ever saw on the shelf still opens fully offline.
+
 ## Snapshots
 - `src/server/snapshots.rs` manages files under `/app/data/snapshots/` (in the Docker volume) via SQLite's `VACUUM INTO` — atomic, online, WAL-safe.
 - **Three sources, distinguished by filename prefix** (the source drives retention):
